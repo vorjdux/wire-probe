@@ -36,7 +36,7 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
         "server" => {
             let bind: String = args
                 .opt_value_from_str("--bind")?
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+                .unwrap_or_else(|| "0.0.0.0".to_string());
             let port: u16 = args.opt_value_from_str("--port")?.unwrap_or(9999);
             reject_unknown(args.finish())?;
             Ok(Mode::Server { bind, port })
@@ -94,11 +94,13 @@ fn reject_unknown(leftover: Vec<OsString>) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Strips characters that are unsafe in ILP tag values and PUTVAL identifiers.
-/// Keeps alphanumeric, hyphen, and dot; replaces everything else with `_`.
+/// Keeps ASCII alphanumeric, hyphen, and dot; replaces everything else with `_`.
+/// ASCII-only: ILP and PUTVAL parsers are ASCII-based; raw UTF-8 multi-byte
+/// sequences would corrupt the byte stream.
 pub fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '.' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
                 c
             } else {
                 '_'

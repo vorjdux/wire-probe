@@ -27,7 +27,9 @@ pub enum Mode {
     },
 }
 
-/// Maximum allowed probe interval (24 h). Prevents u32 overflow in `interval_secs`.
+/// Minimum probe interval (100 ms). Prevents self-DoS via a zero/tiny interval.
+const MIN_INTERVAL_MS: u64 = 100;
+/// Maximum probe interval (24 h). Prevents u32 overflow in `interval_secs`.
 const MAX_INTERVAL_MS: u64 = 86_400_000;
 /// Maximum connect timeout (60 s). Prevents probes from hanging indefinitely.
 const MAX_TIMEOUT_MS: u64 = 60_000;
@@ -53,7 +55,7 @@ PROBE OPTIONS:
   --target <host:port>      wire-probe server address (required)
   --target-name <name>      Label for metric names    [default: derived from --target]
   --az <zone>               Availability-zone tag     [default: default]
-  --interval <duration>     Time between probes       [default: 1000ms]
+  --interval <duration>     Time between probes       [default: 1000ms, min: 100ms, max: 24h]
   --timeout <duration>      Connect timeout per probe [default: 5000ms, max: 60s]
   --export <dst>            Export destination        [default: collectd-exec]
 
@@ -118,6 +120,9 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "collectd-exec".to_string());
 
             let interval = parse_duration(&interval_str)?;
+            if interval.as_millis() < u128::from(MIN_INTERVAL_MS) {
+                return Err(format!("interval too small (min {MIN_INTERVAL_MS}ms)").into());
+            }
             if interval.as_millis() > u128::from(MAX_INTERVAL_MS) {
                 return Err(format!("interval too large (max {MAX_INTERVAL_MS}ms = 24h)").into());
             }

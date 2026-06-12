@@ -20,6 +20,11 @@ import time
 
 PLUGIN_NAME = "wire_probe"
 
+# Total wall-clock budget for one read_cb invocation across all hosts.
+# Keeps the callback under collectd's default 10s Interval regardless of
+# how many hosts or samples are configured.
+_READ_BUDGET_S = 8.0
+
 _hosts = []       # list of (display_name, host, port)
 _timeout = 5.0
 _ping_count = 1
@@ -29,6 +34,10 @@ _default_port = 9999
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _valid_port(port):
+    return 1 <= port <= 65535
+
 
 def _tcp_rtt(host, port, timeout):
     """Return RTT in milliseconds, or None on connection failure."""
@@ -67,7 +76,15 @@ def config_cb(conf):
                 # plain IPv4 host:port  (IPv6 literals would be [::1]:port)
                 parts = raw.rsplit(":", 1)
                 try:
-                    hostname, port = parts[0], int(parts[1])
+                    inline_port = int(parts[1])
+                    if not _valid_port(inline_port):
+                        collectd.warning(
+                            f"{PLUGIN_NAME}: inline port {inline_port} in '{raw}' "
+                            f"out of range [1, 65535], using default port"
+                        )
+                        hostname, port = parts[0], None
+                    else:
+                        hostname, port = parts[0], inline_port
                 except ValueError:
                     hostname, port = raw, None  # resolve port later
             else:
@@ -76,8 +93,8 @@ def config_cb(conf):
 
         elif key == "port":
             port_val = int(node.values[0])
-            if not 1 <= port_val <= 65535:
-                collectd.warning(f"{PLUGIN_NAME}: Port {port_val} out of range, using default {_default_port}")
+            if not _valid_port(port_val):
+                collectd.warning(f"{PLUGIN_NAME}: Port {port_val} out of range [1, 65535], using default {_default_port}")
             else:
                 _default_port = port_val
 
@@ -108,16 +125,25 @@ def init_cb():
 
 
 def read_cb():
+    # Snapshot config so a concurrent reload cannot mutate it mid-read.
     timeout = _timeout
     ping_count = _ping_count
     default_port = _default_port
+
+    # Hard deadline: stop probing when the global budget is exhausted so
+    # this callback never blocks collectd's read thread past _READ_BUDGET_S.
+    deadline = time.monotonic() + _READ_BUDGET_S
 
     for display, hostname, host_port in _hosts:
         port = host_port if host_port is not None else default_port
 
         samples = []
         for _ in range(ping_count):
-            rtt = _tcp_rtt(hostname, port, timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                collectd.warning(f"{PLUGIN_NAME}: read budget exhausted, skipping remaining probes")
+                break
+            rtt = _tcp_rtt(hostname, port, min(timeout, remaining))
             if rtt is not None:
                 samples.append(rtt)
 

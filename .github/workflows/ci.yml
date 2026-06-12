@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build & check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl-tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Clippy
+        run: cargo clippy --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: Confirm binary is fully static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/wire-probe
+          ldd  target/x86_64-unknown-linux-musl/release/wire-probe 2>&1 | grep -q "not a dynamic" \
+            && echo "OK: statically linked" \
+            || (echo "FAIL: unexpected dynamic linkage" && exit 1)
+
+      - name: Smoke test — server starts
+        run: |
+          ./target/x86_64-unknown-linux-musl/release/wire-probe \
+            --mode server --port 19999 &
+          sleep 0.3
+          kill %1
+
+      - name: Smoke test — probe error on refused port
+        run: |
+          ./target/x86_64-unknown-linux-musl/release/wire-probe \
+            --mode probe --target 127.0.0.1:1 \
+            --timeout 200ms --interval 5000ms \
+            --export collectd-exec 2>&1 | grep -q "probe error" \
+            && echo "OK" || (echo "FAIL: expected probe error" && exit 1)

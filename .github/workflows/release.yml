@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build artifacts without creating a release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Static musl builds — single binary works on ANY Linux distro, any glibc version
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  build-static:
+    name: Static · ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: wire-probe-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            artifact: wire-probe-linux-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # cross handles musl toolchain setup inside Docker — no host packages needed
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          cp target/${{ matrix.target }}/release/wire-probe ${{ matrix.artifact }}
+          file ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Native glibc builds — distro-specific, dynamically linked
+  # ──────────────────────────────────────────────────────────────────────────
+  build-distro:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Ubuntu (hosted runners, Rust toolchain action works natively) ──
+          - label: Ubuntu 22.04
+            runner: ubuntu-22.04
+            container: ''
+            artifact: wire-probe-ubuntu22.04-x86_64
+            setup: |
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends gcc
+
+          - label: Ubuntu 24.04
+            runner: ubuntu-24.04
+            container: ''
+            artifact: wire-probe-ubuntu24.04-x86_64
+            setup: |
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends gcc
+
+          # ── Container-based distros ────────────────────────────────────────
+          # For container jobs: install git/curl/gcc before actions/checkout,
+          # then install rustup manually (runner's ~/.cargo is not mounted).
+
+          - label: Fedora 40
+            runner: ubuntu-22.04
+            container: fedora:40
+            artifact: wire-probe-fedora40-x86_64
+            setup: dnf install -y git curl gcc
+
+          - label: Fedora 41
+            runner: ubuntu-22.04
+            container: fedora:41
+            artifact: wire-probe-fedora41-x86_64
+            setup: dnf install -y git curl gcc
+
+          - label: Debian 12 (Bookworm)
+            runner: ubuntu-22.04
+            container: debian:12-slim
+            artifact: wire-probe-debian12-x86_64
+            setup: |
+              apt-get update -qq
+              apt-get install -y --no-install-recommends git curl gcc ca-certificates
+
+          - label: Rocky Linux 9
+            runner: ubuntu-22.04
+            container: rockylinux:9
+            artifact: wire-probe-rockylinux9-x86_64
+            setup: dnf install -y git curl gcc
+
+          - label: AlmaLinux 9
+            runner: ubuntu-22.04
+            container: almalinux:9
+            artifact: wire-probe-almalinux9-x86_64
+            setup: dnf install -y git curl gcc
+
+    steps:
+      # Must run before actions/checkout in container jobs so git is available
+      - name: Install system dependencies
+        run: ${{ matrix.setup }}
+
+      - uses: actions/checkout@v4
+
+      # On Ubuntu runners dtolnay/rust-toolchain works natively.
+      # On container jobs the action runs via the runner host but installs
+      # into the mounted workspace — use rustup directly inside the container.
+      - name: Install Rust (Ubuntu runners)
+        if: matrix.container == ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust (container)
+        if: matrix.container != ''
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.container == ''
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Show linkage
+        run: ldd target/release/wire-probe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/wire-probe
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Assemble release
+  # ──────────────────────────────────────────────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+    needs: [build-static, build-distro]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release directory
+        run: |
+          mkdir -p release
+
+          # Static musl binaries (flat file inside artifact dir)
+          for name in wire-probe-linux-x86_64 wire-probe-linux-aarch64; do
+            src="artifacts/${name}/${name}"
+            [ -f "$src" ] || { echo "Missing: $src"; exit 1; }
+            cp "$src" "release/${name}"
+          done
+
+          # Distro-native binaries (file is named 'wire-probe' inside artifact dir)
+          for dir in artifacts/wire-probe-ubuntu* artifacts/wire-probe-fedora* \
+                     artifacts/wire-probe-debian* artifacts/wire-probe-rocky* \
+                     artifacts/wire-probe-alma*; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            src="$dir/wire-probe"
+            [ -f "$src" ] || { echo "Missing binary in $dir"; exit 1; }
+            cp "$src" "release/${name}"
+          done
+
+          # Install script
+          cp install.sh release/install.sh
+
+          # Make all binaries executable
+          chmod +x release/wire-probe-*
+
+          # SHA-256 checksums
+          cd release
+          sha256sum wire-probe-* install.sh > sha256sums.txt
+          echo "── Release contents ─────────────────────────────────"
+          ls -lh
+          echo ""
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,29 +1,16 @@
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-/// Measures the TCP handshake RTT to `target` and returns milliseconds.
+/// Measures the TCP handshake RTT to `addr` and returns milliseconds.
 ///
-/// `SO_RCVTIMEO` / `SO_SNDTIMEO` are set after connect as safety guards for any
-/// subsequent I/O (none happens here, but the pattern follows the ADR intent).
-pub fn measure_rtt(target: &str, timeout: Duration) -> std::io::Result<f64> {
-    let addr = target
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address resolved"))?;
-
+/// Timing is entirely `connect_timeout` + `Instant`; the `--timeout` flag
+/// is the only bound on how long this call can block. The socket is dropped
+/// immediately after the handshake — no data is ever sent or received.
+#[allow(clippy::cast_precision_loss)]
+pub fn measure_rtt(addr: &SocketAddr, timeout: Duration) -> std::io::Result<f64> {
     let t0 = Instant::now();
-    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    let _stream = TcpStream::connect_timeout(addr, timeout)?;
     // Divide integer nanos rather than multiplying secs_f64 to avoid IEEE 754 drift
     // (e.g. 474389ns * 1e-6 gives 0.47438899999999995 via the secs path).
-    // RTT values are well within f64 mantissa precision; allow the cast.
-    #[allow(clippy::cast_precision_loss)]
-    let rtt_ms = t0.elapsed().as_nanos() as f64 / 1_000_000.0;
-
-    // Aggressive OS-level timeouts: block no longer than `timeout` on any future I/O.
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    // Drop sends RST/FIN, completing the measurement cycle.
-    drop(stream);
-    Ok(rtt_ms)
+    Ok(t0.elapsed().as_nanos() as f64 / 1_000_000.0)
 }

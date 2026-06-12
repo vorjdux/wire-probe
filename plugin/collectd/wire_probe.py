@@ -75,13 +75,25 @@ def config_cb(conf):
             _hosts.append((raw, hostname, port))
 
         elif key == "port":
-            _default_port = int(node.values[0])
+            port_val = int(node.values[0])
+            if not 1 <= port_val <= 65535:
+                collectd.warning(f"{PLUGIN_NAME}: Port {port_val} out of range, using default {_default_port}")
+            else:
+                _default_port = port_val
 
         elif key == "timeout":
-            _timeout = float(node.values[0])
+            t = float(node.values[0])
+            if t <= 0 or t > 60.0:
+                collectd.warning(f"{PLUGIN_NAME}: Timeout {t} out of range (0, 60], using default {_timeout}")
+            else:
+                _timeout = t
 
         elif key == "pingcount":
-            _ping_count = max(1, int(node.values[0]))
+            pc = int(node.values[0])
+            if not 1 <= pc <= 100:
+                collectd.warning(f"{PLUGIN_NAME}: PingCount {pc} out of range [1, 100], using default {_ping_count}")
+            else:
+                _ping_count = pc
 
         else:
             collectd.warning(f"{PLUGIN_NAME}: unknown config key '{node.key}'")

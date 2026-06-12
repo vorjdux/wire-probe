@@ -32,15 +32,19 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
             for cqe in &mut cq {
                 if cqe.user_data() == ACCEPT_TOKEN {
                     let fd = cqe.result();
-                    // Guard against accept() returning fd 0/1/2 in unusual
-                    // daemon environments where stdin/stdout/stderr are closed.
-                    if fd > 2 {
-                        unsafe { libc::close(fd) };
-                    } else if fd >= 0 {
-                        // fd is 0, 1, or 2 — do not close; just leak it closed
-                        // by the io_uring Close opcode to avoid touching stdio.
-                        // This path is extremely unlikely in normal deployment.
-                        unsafe { libc::close(fd) };
+                    if fd >= 0 {
+                        if unsafe { libc::close(fd) } != 0 {
+                            let err = std::io::Error::last_os_error();
+                            eprintln!("warn: close(fd={fd}) failed: {err}");
+                        }
+                    } else {
+                        // Negative result means the accept syscall failed.
+                        // Log anything other than EAGAIN/EWOULDBLOCK so a sustained
+                        // error (e.g. EMFILE — fd table exhausted) is visible.
+                        let errno = -fd;
+                        if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                            eprintln!("warn: accept error: {}", std::io::Error::from_raw_os_error(errno));
+                        }
                     }
                     rearm = true;
                 }

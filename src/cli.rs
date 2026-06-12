@@ -29,6 +29,8 @@ pub enum Mode {
 
 /// Maximum allowed probe interval (24 h). Prevents u32 overflow in `interval_secs`.
 const MAX_INTERVAL_MS: u64 = 86_400_000;
+/// Maximum connect timeout (60 s). Prevents probes from hanging indefinitely.
+const MAX_TIMEOUT_MS: u64 = 60_000;
 
 pub fn print_help() {
     eprintln!(
@@ -52,7 +54,7 @@ PROBE OPTIONS:
   --target-name <name>      Label for metric names    [default: derived from --target]
   --az <zone>               Availability-zone tag     [default: default]
   --interval <duration>     Time between probes       [default: 1000ms]
-  --timeout <duration>      Connect timeout per probe [default: 5000ms]
+  --timeout <duration>      Connect timeout per probe [default: 5000ms, max: 60s]
   --export <dst>            Export destination        [default: collectd-exec]
 
 EXPORT DESTINATIONS:
@@ -120,6 +122,12 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
                 return Err(format!("interval too large (max {MAX_INTERVAL_MS}ms = 24h)").into());
             }
             let timeout = parse_duration(&timeout_str)?;
+            if timeout.is_zero() {
+                return Err("timeout must be greater than zero".into());
+            }
+            if timeout.as_millis() > u128::from(MAX_TIMEOUT_MS) {
+                return Err(format!("timeout too large (max {MAX_TIMEOUT_MS}ms = 60s)").into());
+            }
             let export = parse_export(&export_str)?;
             reject_unknown(args.finish())?;
 

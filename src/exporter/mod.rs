@@ -18,13 +18,13 @@ impl Exporter {
         interval_secs: u32,
     ) -> io::Result<Self> {
         match dst {
-            ExportDst::TelegrafUdp(addr) => Ok(Exporter::Telegraf(
+            ExportDst::TelegrafUdp(addr) => Ok(Self::Telegraf(
                 telegraf::TelegrafExporter::new(addr, target_name, az)?,
             )),
-            ExportDst::CollectdUds(path) => Ok(Exporter::Collectd(
+            ExportDst::CollectdUds(path) => Ok(Self::Collectd(
                 collectd::CollectdExporter::new_uds(path, hostname, target_name, interval_secs)?,
             )),
-            ExportDst::CollectdExec => Ok(Exporter::Collectd(
+            ExportDst::CollectdExec => Ok(Self::Collectd(
                 collectd::CollectdExporter::new_exec(hostname, target_name, interval_secs),
             )),
         }
@@ -32,8 +32,8 @@ impl Exporter {
 
     pub fn send(&mut self, rtt_ms: f64, ts_ns: u64) -> io::Result<()> {
         match self {
-            Exporter::Telegraf(e) => e.send(rtt_ms, ts_ns),
-            Exporter::Collectd(e) => e.send(rtt_ms),
+            Self::Telegraf(e) => e.send(rtt_ms, ts_ns),
+            Self::Collectd(e) => e.send(rtt_ms),
         }
     }
 }

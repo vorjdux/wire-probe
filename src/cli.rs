@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::time::Duration;
 use pico_args::Arguments;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug)]
 pub enum ExportDst {
     TelegrafUdp(String),
@@ -25,12 +27,66 @@ pub enum Mode {
     },
 }
 
-/// Maximum allowed probe interval (24 h). Prevents u32 overflow in interval_secs.
+/// Maximum allowed probe interval (24 h). Prevents u32 overflow in `interval_secs`.
 const MAX_INTERVAL_MS: u64 = 86_400_000;
+
+pub fn print_help() {
+    eprintln!(
+        "wire-probe {VERSION} — zero-footprint L4 TCP telemetry agent
+Author: Matheus Santos <vorj.dux@gmail.com>
+License: MIT  |  https://github.com/vorjdux/wire-probe
+
+USAGE:
+    wire-probe --mode <server|probe> [OPTIONS]
+
+MODES:
+  server    Accept/drop loop on the target host (io_uring, ~500 KB RSS)
+  probe     Measure TCP handshake RTT and export metrics
+
+SERVER OPTIONS:
+  --port <port>       TCP port to listen on          [default: 9999]
+  --bind <addr>       Bind address                   [default: 0.0.0.0]
+
+PROBE OPTIONS:
+  --target <host:port>      wire-probe server address (required)
+  --target-name <name>      Label for metric names    [default: derived from --target]
+  --az <zone>               Availability-zone tag     [default: default]
+  --interval <duration>     Time between probes       [default: 1000ms]
+  --timeout <duration>      Connect timeout per probe [default: 5000ms]
+  --export <dst>            Export destination        [default: collectd-exec]
+
+EXPORT DESTINATIONS:
+  collectd-exec                     Write PUTVAL lines to stdout
+  collectd-uds://<path>             Write PUTVAL lines to a Unix socket
+  telegraf-udp://<host>:<port>      Send Influx Line Protocol over UDP
+
+DURATION FORMAT:
+  Suffix with 'ms' for milliseconds or 's' for seconds (e.g. 500ms, 10s)
+
+EXAMPLES:
+  wire-probe --mode server --port 9999
+  wire-probe --mode probe --target db-host:9999 --export telegraf-udp://127.0.0.1:8094
+  wire-probe --mode probe --target db-host:9999 --interval 10s --export collectd-exec"
+    );
+}
 
 pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
     let mut args = Arguments::from_env();
-    let mode: String = args.value_from_str("--mode")?;
+
+    if args.contains(["-h", "--help"]) {
+        print_help();
+        std::process::exit(0);
+    }
+
+    if args.contains("--version") {
+        eprintln!("wire-probe {VERSION}");
+        std::process::exit(0);
+    }
+
+    let mode: String = args.opt_value_from_str("--mode")?.ok_or_else(|| {
+        print_help();
+        "missing required flag --mode"
+    })?;
 
     match mode.as_str() {
         "server" => {
@@ -45,12 +101,10 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
             let target: String = args.value_from_str("--target")?;
             let target_name: String = args
                 .opt_value_from_str("--target-name")?
-                .map(|s: String| sanitize(&s))
-                .unwrap_or_else(|| sanitize(&target));
+                .map_or_else(|| sanitize(&target), |s: String| sanitize(&s));
             let az: String = args
                 .opt_value_from_str("--az")?
-                .map(|s: String| sanitize(&s))
-                .unwrap_or_else(|| "default".to_string());
+                .map_or_else(|| "default".to_string(), |s: String| sanitize(&s));
             let interval_str: String = args
                 .opt_value_from_str("--interval")?
                 .unwrap_or_else(|| "1000ms".to_string());
@@ -62,12 +116,8 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "collectd-exec".to_string());
 
             let interval = parse_duration(&interval_str)?;
-            if interval.as_millis() as u64 > MAX_INTERVAL_MS {
-                return Err(format!(
-                    "interval too large (max {}ms = 24h)",
-                    MAX_INTERVAL_MS
-                )
-                .into());
+            if interval.as_millis() > u128::from(MAX_INTERVAL_MS) {
+                return Err(format!("interval too large (max {MAX_INTERVAL_MS}ms = 24h)").into());
             }
             let timeout = parse_duration(&timeout_str)?;
             let export = parse_export(&export_str)?;
@@ -119,6 +169,7 @@ fn parse_duration(s: &str) -> Result<Duration, Box<dyn std::error::Error>> {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn parse_export(s: &str) -> Result<ExportDst, Box<dyn std::error::Error>> {
     if let Some(addr) = s.strip_prefix("telegraf-udp://") {
         Ok(ExportDst::TelegrafUdp(addr.to_string()))

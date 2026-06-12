@@ -36,7 +36,7 @@ jobs:
         run: |
           file target/x86_64-unknown-linux-musl/release/wire-probe
           ldd target/x86_64-unknown-linux-musl/release/wire-probe 2>&1 \
-            | grep -q "not a dynamic" \
+            | grep -qE "not a dynamic|statically linked" \
             && echo "OK: statically linked" \
             || (echo "FAIL: unexpected dynamic linkage" && exit 1)
 

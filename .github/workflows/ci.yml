@@ -35,7 +35,8 @@ jobs:
       - name: Confirm binary is fully static
         run: |
           file target/x86_64-unknown-linux-musl/release/wire-probe
-          ldd  target/x86_64-unknown-linux-musl/release/wire-probe 2>&1 | grep -q "not a dynamic" \
+          ldd target/x86_64-unknown-linux-musl/release/wire-probe 2>&1 \
+            | grep -q "not a dynamic" \
             && echo "OK: statically linked" \
             || (echo "FAIL: unexpected dynamic linkage" && exit 1)
 
@@ -46,10 +47,18 @@ jobs:
           sleep 0.3
           kill %1
 
-      - name: Smoke test — probe error on refused port
+      - name: Smoke test — probe fails cleanly on refused port
         run: |
           ./target/x86_64-unknown-linux-musl/release/wire-probe \
             --mode probe --target 127.0.0.1:1 \
             --timeout 200ms --interval 5000ms \
             --export collectd-exec 2>&1 | grep -q "probe error" \
             && echo "OK" || (echo "FAIL: expected probe error" && exit 1)
+
+      - name: Smoke test — package tarball
+        run: |
+          DIR="wire-probe-ci-linux-x86_64"
+          mkdir "$DIR"
+          cp target/x86_64-unknown-linux-musl/release/wire-probe "$DIR/"
+          tar czf "${DIR}.tar.gz" "$DIR/"
+          tar tzf "${DIR}.tar.gz"

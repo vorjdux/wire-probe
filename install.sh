@@ -1,106 +1,155 @@
 #!/bin/sh
 # wire-probe installer
-# Usage: curl -sfL https://github.com/vorjdux/wire-probe/releases/latest/download/install.sh | sudo sh
-# Or:    curl -sfL <url> | sh   (installs to ~/.local/bin when not root)
+#
+# Usage:
+#   curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh | sh
+#
+# Environment overrides:
+#   VERSION=0.1.0   install a specific version (without the 'v' prefix)
+#   INSTALL_DIR=/usr/local/bin   override install location
+#   NO_COLOR=1      disable coloured output
 set -e
 
 REPO="vorjdux/wire-probe"
 BINARY="wire-probe"
 
-# ── Resolve install directory ──────────────────────────────────────────────
-if [ "$(id -u)" -eq 0 ]; then
-  INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+# ── Colour output ──────────────────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+  RED='\033[0;31m';   BOLD='\033[1m';  RESET='\033[0m'
 else
-  INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-  mkdir -p "$INSTALL_DIR"
+  GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 fi
 
-# ── Detect architecture ────────────────────────────────────────────────────
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64|amd64)           ARCH_SLUG="x86_64"  ;;
-  aarch64|arm64|armv8*)   ARCH_SLUG="aarch64" ;;
-  *)
-    echo "error: unsupported architecture '$ARCH'" >&2
-    echo "       Build from source: https://github.com/$REPO" >&2
-    exit 1
-    ;;
+info()  { printf "${BOLD}%s${RESET}\n"   "$*"; }
+ok()    { printf "${GREEN}✓ %s${RESET}\n" "$*"; }
+warn()  { printf "${YELLOW}! %s${RESET}\n" "$*" >&2; }
+die()   { printf "${RED}error: %s${RESET}\n" "$*" >&2; exit 1; }
+
+# ── Argument parsing ───────────────────────────────────────────────────────
+DRY_RUN=0
+NO_MODIFY_PATH=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)        DRY_RUN=1 ;;
+    --no-modify-path) NO_MODIFY_PATH=1 ;;
+    --help|-h)
+      echo "Usage: install.sh [--dry-run] [--no-modify-path]"
+      echo ""
+      echo "Environment variables:"
+      echo "  VERSION=0.1.0       install a specific version"
+      echo "  INSTALL_DIR=/path   override install directory"
+      exit 0 ;;
+  esac
+done
+
+# ── Dependency check ───────────────────────────────────────────────────────
+for cmd in curl tar; do
+  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
+done
+
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256_CMD="shasum -a 256"
+else
+  warn "sha256sum/shasum not found — skipping checksum verification"
+  SHA256_CMD=""
+fi
+
+# ── Platform detection ─────────────────────────────────────────────────────
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$OS" in
+  linux)  OS="linux" ;;
+  *)      die "unsupported OS '$OS' — only Linux is supported" ;;
 esac
 
-# Static musl binary: works on Ubuntu, Fedora, Debian, RHEL, Alpine, etc.
-ARTIFACT="${BINARY}-linux-${ARCH_SLUG}"
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64)           ARCH="x86_64"  ;;
+  aarch64|arm64|armv8*)   ARCH="aarch64" ;;
+  *)      die "unsupported architecture '$ARCH'" ;;
+esac
 
-# ── Resolve latest version ─────────────────────────────────────────────────
-if [ -z "$VERSION" ]; then
+# ── Version resolution ─────────────────────────────────────────────────────
+if [ -z "${VERSION:-}" ]; then
   VERSION=$(curl -sfL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    | grep '"tag_name"' | head -1 \
+    | sed 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/')
+  [ -n "$VERSION" ] || die "could not resolve latest version from GitHub API"
 fi
 
-if [ -z "$VERSION" ]; then
-  echo "error: could not resolve latest release from GitHub API" >&2
-  echo "       Set VERSION=vX.Y.Z to install a specific version" >&2
-  exit 1
+# ── Paths ──────────────────────────────────────────────────────────────────
+if [ -z "${INSTALL_DIR:-}" ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    INSTALL_DIR="/usr/local/bin"
+  else
+    INSTALL_DIR="$HOME/.local/bin"
+    mkdir -p "$INSTALL_DIR"
+  fi
 fi
 
-BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+ARCHIVE_NAME="${BINARY}-${VERSION}-${OS}-${ARCH}.tar.gz"
+BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
+ARCHIVE_URL="${BASE_URL}/${ARCHIVE_NAME}"
+SUMS_URL="${BASE_URL}/SHA256SUMS"
 
-# ── Verify checksum tool availability ─────────────────────────────────────
-if command -v sha256sum >/dev/null 2>&1; then
-  SHA_CMD="sha256sum"
-elif command -v shasum >/dev/null 2>&1; then
-  SHA_CMD="shasum -a 256"
-else
-  SHA_CMD=""
-fi
+# ── Summary ────────────────────────────────────────────────────────────────
+info "Installing ${BINARY} v${VERSION} (${OS}/${ARCH})"
+info "  from:  ${ARCHIVE_URL}"
+info "  into:  ${INSTALL_DIR}"
+
+[ "$DRY_RUN" -eq 1 ] && { ok "dry-run: nothing downloaded"; exit 0; }
 
 # ── Download ───────────────────────────────────────────────────────────────
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "Installing wire-probe ${VERSION} for linux/${ARCH_SLUG} → ${INSTALL_DIR}/${BINARY}"
+ARCHIVE_PATH="${TMP_DIR}/${ARCHIVE_NAME}"
 
-curl --proto '=https' --tlsv1.2 -sfL \
-  "${BASE_URL}/${ARTIFACT}" \
-  -o "${TMP_DIR}/${BINARY}"
+curl --proto '=https' --tlsv1.2 -sfL "$ARCHIVE_URL" -o "$ARCHIVE_PATH" \
+  || die "download failed: ${ARCHIVE_URL}"
 
-# ── Verify checksum (best-effort) ─────────────────────────────────────────
-if [ -n "$SHA_CMD" ]; then
-  curl --proto '=https' --tlsv1.2 -sfL \
-    "${BASE_URL}/sha256sums.txt" \
-    -o "${TMP_DIR}/sha256sums.txt" 2>/dev/null || true
+# ── Checksum verification ──────────────────────────────────────────────────
+if [ -n "$SHA256_CMD" ]; then
+  SUMS_PATH="${TMP_DIR}/SHA256SUMS"
+  curl --proto '=https' --tlsv1.2 -sfL "$SUMS_URL" -o "$SUMS_PATH" 2>/dev/null || true
 
-  if [ -f "${TMP_DIR}/sha256sums.txt" ]; then
-    EXPECTED=$(grep "${ARTIFACT}" "${TMP_DIR}/sha256sums.txt" | awk '{print $1}')
+  if [ -f "$SUMS_PATH" ]; then
+    EXPECTED=$(grep "${ARCHIVE_NAME}" "$SUMS_PATH" | cut -d' ' -f1)
     if [ -n "$EXPECTED" ]; then
-      ACTUAL=$(cd "$TMP_DIR" && $SHA_CMD "$BINARY" | awk '{print $1}')
-      if [ "$ACTUAL" != "$EXPECTED" ]; then
-        echo "error: checksum mismatch for ${ARTIFACT}" >&2
-        echo "  expected: $EXPECTED" >&2
-        echo "  actual:   $ACTUAL" >&2
-        exit 1
-      fi
-      echo "Checksum OK: $ACTUAL"
+      ACTUAL=$($SHA256_CMD "$ARCHIVE_PATH" | cut -d' ' -f1)
+      [ "$ACTUAL" = "$EXPECTED" ] || die "checksum mismatch for ${ARCHIVE_NAME}
+  expected: ${EXPECTED}
+  actual:   ${ACTUAL}"
+      ok "checksum verified"
+    else
+      warn "archive not found in SHA256SUMS — skipping"
     fi
+  else
+    warn "SHA256SUMS not available — skipping checksum"
   fi
 fi
 
-# ── Install ────────────────────────────────────────────────────────────────
-chmod +x "${TMP_DIR}/${BINARY}"
-mv "${TMP_DIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+# ── Extract and install ────────────────────────────────────────────────────
+tar xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
+EXTRACTED=$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)
+[ -n "$EXTRACTED" ] || die "binary '${BINARY}' not found in archive"
 
-echo "Installed: ${INSTALL_DIR}/${BINARY}"
+chmod +x "$EXTRACTED"
+mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
 
-# PATH hint for non-root installs
-if [ "$(id -u)" -ne 0 ]; then
-  case ":$PATH:" in
+ok "installed ${INSTALL_DIR}/${BINARY}"
+
+# ── PATH hint ──────────────────────────────────────────────────────────────
+if [ "$NO_MODIFY_PATH" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+  case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
-      echo ""
-      echo "NOTE: ${INSTALL_DIR} is not in your PATH."
-      echo "      Add it with:"
-      echo "        echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.profile"
+      warn "${INSTALL_DIR} is not in your PATH. Add it with:"
+      printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.profile\n' "$INSTALL_DIR"
       ;;
   esac
 fi
 
-echo "Done. Run: ${BINARY} --mode server --port 9999"
+ok "Done — run: ${BINARY} --mode server --port 9999"

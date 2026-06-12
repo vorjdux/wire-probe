@@ -33,7 +33,18 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
                 if cqe.user_data() == ACCEPT_TOKEN {
                     let fd = cqe.result();
                     if fd >= 0 {
-                        unsafe { libc::close(fd) };
+                        if unsafe { libc::close(fd) } != 0 {
+                            let err = std::io::Error::last_os_error();
+                            eprintln!("warn: close(fd={fd}) failed: {err}");
+                        }
+                    } else {
+                        // Negative result means the accept syscall failed.
+                        // Log anything other than EAGAIN/EWOULDBLOCK so a sustained
+                        // error (e.g. EMFILE — fd table exhausted) is visible.
+                        let errno = -fd;
+                        if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                            eprintln!("warn: accept error: {}", std::io::Error::from_raw_os_error(errno));
+                        }
                     }
                     rearm = true;
                 }

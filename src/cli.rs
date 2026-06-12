@@ -27,7 +27,7 @@ pub enum Mode {
     },
 }
 
-/// Maximum allowed probe interval (24 h). Prevents u32 overflow in interval_secs.
+/// Maximum allowed probe interval (24 h). Prevents u32 overflow in `interval_secs`.
 const MAX_INTERVAL_MS: u64 = 86_400_000;
 
 pub fn print_help() {
@@ -101,12 +101,10 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
             let target: String = args.value_from_str("--target")?;
             let target_name: String = args
                 .opt_value_from_str("--target-name")?
-                .map(|s: String| sanitize(&s))
-                .unwrap_or_else(|| sanitize(&target));
+                .map_or_else(|| sanitize(&target), |s: String| sanitize(&s));
             let az: String = args
                 .opt_value_from_str("--az")?
-                .map(|s: String| sanitize(&s))
-                .unwrap_or_else(|| "default".to_string());
+                .map_or_else(|| "default".to_string(), |s: String| sanitize(&s));
             let interval_str: String = args
                 .opt_value_from_str("--interval")?
                 .unwrap_or_else(|| "1000ms".to_string());
@@ -118,12 +116,8 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "collectd-exec".to_string());
 
             let interval = parse_duration(&interval_str)?;
-            if interval.as_millis() as u64 > MAX_INTERVAL_MS {
-                return Err(format!(
-                    "interval too large (max {}ms = 24h)",
-                    MAX_INTERVAL_MS
-                )
-                .into());
+            if interval.as_millis() > u128::from(MAX_INTERVAL_MS) {
+                return Err(format!("interval too large (max {MAX_INTERVAL_MS}ms = 24h)").into());
             }
             let timeout = parse_duration(&timeout_str)?;
             let export = parse_export(&export_str)?;
@@ -175,6 +169,7 @@ fn parse_duration(s: &str) -> Result<Duration, Box<dyn std::error::Error>> {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn parse_export(s: &str) -> Result<ExportDst, Box<dyn std::error::Error>> {
     if let Some(addr) = s.strip_prefix("telegraf-udp://") {
         Ok(ExportDst::TelegrafUdp(addr.to_string()))

@@ -31,7 +31,8 @@ fn main() {
         } => {
             let host = hostname();
             // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
-            // The CLI already rejects values > 86400s so the cast is safe.
+            // CLI rejects values > 86400s and max(1.0) guarantees positive; casts are safe.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let interval_secs = interval.as_secs_f64().round().max(1.0) as u32;
 
             let mut exp =
@@ -47,6 +48,8 @@ fn main() {
 
                 match probe::measure_rtt(&target, timeout) {
                     Ok(rtt_ms) => {
+                        // u64 nanoseconds wraps in year ~2554; safe for practical use.
+                        #[allow(clippy::cast_possible_truncation)]
                         let ts_ns = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or(Duration::ZERO)
@@ -59,8 +62,8 @@ fn main() {
                 }
 
                 let elapsed = tick.elapsed();
-                if elapsed < interval {
-                    std::thread::sleep(interval - elapsed);
+                if let Some(remaining) = interval.checked_sub(elapsed) {
+                    std::thread::sleep(remaining);
                 }
             }
         }
@@ -73,7 +76,7 @@ fn hostname() -> String {
     // the result is always null-terminated even if the name is exactly 255 chars.
     let mut buf = [0u8; 256];
     unsafe {
-        libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+        libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len());
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     // Sanitise: hostnames injected via orchestrators (k8s, cloud init) may

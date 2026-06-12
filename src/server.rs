@@ -3,6 +3,7 @@ use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
 
 const ACCEPT_TOKEN: u64 = 1;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind_addr, port))?;
@@ -13,7 +14,14 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
     push_accept(&mut ring, listener_fd)?;
     ring.submit()?;
 
-    eprintln!("server listening on {bind_addr}:{port} (io_uring accept/drop loop)");
+    let pid = unsafe { libc::getpid() };
+    eprintln!(
+        "wire-probe {VERSION} — L4 TCP telemetry server
+  pid:     {pid}
+  listen:  {bind_addr}:{port}
+  mode:    io_uring accept/drop loop
+  author:  Matheus Santos <vorj.dux@gmail.com>"
+    );
 
     loop {
         ring.submit_and_wait(1)?;

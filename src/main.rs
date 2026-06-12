@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     let mode = cli::parse().unwrap_or_else(|e| {
-        eprintln!("error: {e}");
+        eprintln!("\nerror: {e}");
         std::process::exit(1);
     });
 

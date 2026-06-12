@@ -229,6 +229,37 @@ cargo build --release --target x86_64-unknown-linux-musl
 | Export reliability | Fire-and-forget; no retry, no queue — if Telegraf/Collectd is down, the probe skips |
 | Binary size | 370 KB stripped (fat LTO, `panic = "abort"`, `strip = true`) |
 
+## Behind the Design
+
+`wire-probe` was built to measure pure L3/L4 Data Plane latency, completely isolated from SDN Control Plane throttling (which heavily skews ICMP ping on cloud providers like Azure) and L7 application bottlenecks. To achieve a zero-footprint observer effect, every architectural decision prioritized bypassing userland overhead.
+
+### 1. Bypassing Async Runtimes for Direct Kernel Interfaces
+
+Including a standard async runtime (like `tokio`) imposes an unacceptable baseline memory footprint (2–5 MB RSS) and scheduler overhead for a binary whose sole purpose is handling socket file descriptors.
+
+- **Server mode (`io_uring`):** The TCP accept/drop loop is delegated directly to the Linux kernel's asynchronous submission/completion queues. By eliminating userland context-switching, the daemon maintains an RSS under ~500 KB regardless of inbound PPS rate.
+- **Probe mode (native blocking):** Relies on native blocking threads (`TcpStream::connect_timeout`) enforced by strict OS-level guards (`SO_RCVTIMEO` and `SO_SNDTIMEO`). This prevents socket deadlocks directly at the OS network ring, ensuring deterministic execution without instantiating reactive application-space timers.
+
+### 2. Zero-Allocation Hot Path and Binary Density
+
+To guarantee the process runs entirely within the CPU's L1/L2 caches and avoids memory fragmentation during long-running execution, the binary is extremely dense.
+
+- Compiled statically via `musl-libc` with fat LTO and `panic = "abort"`, resulting in a ~370 KB stripped binary.
+- Heap allocations on the hot path are strictly forbidden. Telemetry formatting relies on direct stack-based buffer writing (`ryu` for floats, `itoa` for integers), bypassing the standard library's string formatting overhead entirely.
+
+### 3. Fire-and-Forget Export and Backpressure Offloading
+
+An observability probe must never crash or block because the downstream telemetry pipeline degraded.
+
+- By forcing metric injection via UDP datagrams (Telegraf/Influx) or Unix domain sockets (Collectd), `wire-probe` structurally outsources backpressure handling to the Linux kernel.
+- If the destination TSDB stalls or the Telegraf process hangs, the kernel applies a silent tail-drop at the receive buffer. This isolates the probe, shielding it from file descriptor exhaustion or OOM kills.
+
+### 4. Pragmatic Collectd Integration
+
+Using collectd's standard `Exec` plugin to run a binary every 10 seconds creates cumulative CPU overhead due to continuous `fork`/`exec` system calls.
+
+- To solve this, the project includes a native Python wrapper (`wire_probe.py`). Instead of spawning a new OS process per interval, the wrapper allows collectd's C runtime to handle the scheduling loop internally, bypassing OS-level process bootstrapping overhead while maintaining exact metric fidelity.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

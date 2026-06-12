@@ -15,7 +15,7 @@ latency a real client sees — with no kernel module, no eBPF, no agent framewor
 - **Server mode** — `io_uring` accept/drop loop; accepts SYNs and immediately
   closes them, consuming ~500 KB RSS at any connection rate
 - **Probe mode** — blocking `TcpStream::connect_timeout` wrapped with
-  `std::time::Instant`; sets `SO_RCVTIMEO`/`SO_SNDTIMEO` as OS-level guards
+  `std::time::Instant`; the `--timeout` flag is the only timing bound
 - **Fire-and-forget export** — UDP (Telegraf Influx Line Protocol) or Unix
   domain socket / stdout (Collectd PUTVAL); no buffering, no retries
 - **Single static binary** — musl-linked, 370 KB stripped, zero glibc version
@@ -30,7 +30,7 @@ curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh |
 Or install a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh | VERSION=0.1.0 sh
+curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh | VERSION=0.1.2 sh
 ```
 
 Pre-built tarballs for every platform are on the [releases page](https://github.com/vorjdux/wire-probe/releases/latest).
@@ -107,8 +107,8 @@ wire-probe --mode probe --target <host:port> [options]
 | `--target` | *(required)* | `host:port` of the wire-probe server |
 | `--target-name` | derived from `--target` | Label used in metric names |
 | `--az` | `default` | Availability-zone tag (Telegraf only) |
-| `--interval` | `1000ms` | Time between probes (`ms` or `s` suffix) |
-| `--timeout` | `5000ms` | Connect timeout per probe |
+| `--interval` | `1000ms` | Time between probes (`ms` or `s` suffix); min 100ms, max 24h |
+| `--timeout` | `5000ms` | Connect timeout per probe; max 60s |
 | `--export` | `collectd-exec` | Export destination (see below) |
 
 ## Export targets
@@ -180,8 +180,9 @@ of collectd required.
   Host "db-node-02"
   Host "app-node-01"
 
-  Port    9999
-  Timeout 5.0
+  Port      9999
+  Timeout   5.0
+  PingCount 1
 </Plugin>
 ```
 

@@ -21,7 +21,7 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
         let mut rearm = false;
         {
             let mut cq = ring.completion();
-            while let Some(cqe) = cq.next() {
+            for cqe in &mut cq {
                 if cqe.user_data() == ACCEPT_TOKEN {
                     let fd = cqe.result();
                     // Guard against accept() returning fd 0/1/2 in unusual

@@ -175,11 +175,9 @@ of collectd required.
 
 ```xml
 <Plugin wire_probe>
-  Host "hab-platform02-es"
-  Host "hab-platform03-es"
-  Host "hab-mongo01-es"
-  Host "hab-psql01-es"
-  Host "hab-redis01-es"
+  Host "db-node-01"
+  Host "db-node-02"
+  Host "app-node-01"
 
   Port    9999
   Timeout 5.0

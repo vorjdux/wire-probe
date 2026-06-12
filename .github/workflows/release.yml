@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build artifacts without publishing a release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Static musl builds — tarball works on ANY Linux distro, any glibc version
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  build-static:
+    name: Static · ${{ matrix.arch }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          ARCHIVE="wire-probe-${VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          DIR="wire-probe-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir "$DIR"
+          cp target/${{ matrix.target }}/release/wire-probe "$DIR/"
+          tar czf "$ARCHIVE" "$DIR/"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: static-linux-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Native glibc builds — distro-specific tarballs
+  # ──────────────────────────────────────────────────────────────────────────
+  build-distro:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Ubuntu 22.04
+            runner: ubuntu-22.04
+            container: ''
+            os_slug: ubuntu22.04
+
+          - label: Ubuntu 24.04
+            runner: ubuntu-24.04
+            container: ''
+            os_slug: ubuntu24.04
+
+          - label: Fedora 40
+            runner: ubuntu-22.04
+            container: fedora:40
+            os_slug: fedora40
+
+          - label: Fedora 41
+            runner: ubuntu-22.04
+            container: fedora:41
+            os_slug: fedora41
+
+          - label: Debian 12 (Bookworm)
+            runner: ubuntu-22.04
+            container: debian:12-slim
+            os_slug: debian12
+
+          - label: Rocky Linux 9
+            runner: ubuntu-22.04
+            container: rockylinux:9
+            os_slug: rockylinux9
+
+          - label: AlmaLinux 9
+            runner: ubuntu-22.04
+            container: almalinux:9
+            os_slug: almalinux9
+
+    steps:
+      - name: Install deps — Fedora / Rocky / Alma
+        if: contains(fromJSON('["Fedora 40","Fedora 41","Rocky Linux 9","AlmaLinux 9"]'), matrix.label)
+        run: dnf install -y git curl gcc
+
+      - name: Install deps — Debian
+        if: startsWith(matrix.label, 'Debian')
+        run: apt-get update -qq && apt-get install -y --no-install-recommends git curl gcc ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (hosted runner)
+        if: matrix.container == ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust (container)
+        if: matrix.container != ''
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.container == ''
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="dev"
+          ARCHIVE="wire-probe-${VERSION}-${{ matrix.os_slug }}-x86_64.tar.gz"
+          DIR="wire-probe-${VERSION}-${{ matrix.os_slug }}-x86_64"
+          mkdir "$DIR"
+          cp target/release/wire-probe "$DIR/"
+          tar czf "$ARCHIVE" "$DIR/"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distro-${{ matrix.os_slug }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Publish release
+  # ──────────────────────────────────────────────────────────────────────────
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry_run
+    needs: [build-static, build-distro]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect into dist/ and generate SHA256SUMS
+        run: |
+          mkdir -p dist
+          find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum * > SHA256SUMS
+          echo "── dist contents ─────────────────────────────────"
+          ls -lh
+          echo ""
+          cat SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG (if present)
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -f CHANGELOG.md ]; then
+            awk "/^## \[?${VERSION}\]?/,/^## /" CHANGELOG.md \
+              | head -n -1 > release_notes.md
+          else
+            echo "Release ${GITHUB_REF_NAME}" > release_notes.md
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRERELEASE=""
+          echo "${GITHUB_REF_NAME}" | grep -q '-' && PRERELEASE="--prerelease"
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "wire-probe ${GITHUB_REF_NAME#v}" \
+            --notes-file release_notes.md \
+            $PRERELEASE
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # dry-run: just show what would be released
+  # ──────────────────────────────────────────────────────────────────────────
+  dry-run-summary:
+    if: inputs.dry_run
+    needs: [build-static, build-distro]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Show artifacts
+        run: |
+          echo "=== Would release the following files ==="
+          find artifacts -name '*.tar.gz' | sort

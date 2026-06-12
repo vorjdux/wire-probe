@@ -30,7 +30,8 @@ fn main() {
             export,
         } => {
             let host = hostname();
-            let interval_secs = interval.as_secs().max(1) as u32;
+            // Round to nearest second; collectd PUTVAL interval= is integer seconds.
+            let interval_secs = interval.as_secs_f64().round().max(1.0) as u32;
 
             let mut exp =
                 Exporter::new(&export, &target_name, &az, &host, interval_secs).unwrap_or_else(

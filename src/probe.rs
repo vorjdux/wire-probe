@@ -13,7 +13,9 @@ pub fn measure_rtt(target: &str, timeout: Duration) -> std::io::Result<f64> {
 
     let t0 = Instant::now();
     let stream = TcpStream::connect_timeout(&addr, timeout)?;
-    let rtt_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+    // Divide integer nanos rather than multiplying secs_f64 to avoid IEEE 754 drift
+    // (e.g. 474389ns * 1e-6 gives 0.47438899999999995 via the secs path).
+    let rtt_ms = t0.elapsed().as_nanos() as f64 / 1_000_000.0;
 
     // Aggressive OS-level timeouts: block no longer than `timeout` on any future I/O.
     stream.set_read_timeout(Some(timeout))?;

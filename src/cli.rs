@@ -30,15 +30,18 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
     match mode.as_str() {
         "server" => {
             let port: u16 = args.opt_value_from_str("--port")?.unwrap_or(9999);
+            reject_unknown(args.finish())?;
             Ok(Mode::Server { port })
         }
         "probe" => {
             let target: String = args.value_from_str("--target")?;
             let target_name: String = args
                 .opt_value_from_str("--target-name")?
+                .map(|s: String| sanitize(&s))
                 .unwrap_or_else(|| sanitize(&target));
             let az: String = args
                 .opt_value_from_str("--az")?
+                .map(|s: String| sanitize(&s))
                 .unwrap_or_else(|| "default".to_string());
             let interval_str: String = args
                 .opt_value_from_str("--interval")?
@@ -53,6 +56,7 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
             let interval = parse_duration(&interval_str)?;
             let timeout = parse_duration(&timeout_str)?;
             let export = parse_export(&export_str)?;
+            reject_unknown(args.finish())?;
 
             Ok(Mode::Probe {
                 target,
@@ -65,6 +69,13 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
         }
         other => Err(format!("unknown mode '{other}'; expected 'server' or 'probe'").into()),
     }
+}
+
+fn reject_unknown(leftover: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(arg) = leftover.into_iter().next() {
+        return Err(format!("unexpected argument: {}", arg.to_string_lossy()).into());
+    }
+    Ok(())
 }
 
 fn sanitize(s: &str) -> String {

@@ -32,14 +32,7 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
             for cqe in &mut cq {
                 if cqe.user_data() == ACCEPT_TOKEN {
                     let fd = cqe.result();
-                    // Guard against accept() returning fd 0/1/2 in unusual
-                    // daemon environments where stdin/stdout/stderr are closed.
-                    if fd > 2 {
-                        unsafe { libc::close(fd) };
-                    } else if fd >= 0 {
-                        // fd is 0, 1, or 2 — do not close; just leak it closed
-                        // by the io_uring Close opcode to avoid touching stdio.
-                        // This path is extremely unlikely in normal deployment.
+                    if fd >= 0 {
                         unsafe { libc::close(fd) };
                     }
                     rearm = true;

@@ -95,7 +95,8 @@ wire-probe --mode server [--port <port>] [--bind <addr>]
 ### Probe mode
 
 Runs on the observer host. Measures the TCP handshake RTT to the target and
-exports the result on every interval.
+exports the result on every interval. The target address is resolved once at
+startup — use an IP address if DNS reliability on your network is a concern.
 
 ```
 wire-probe --mode probe --target <host:port> [options]
@@ -225,7 +226,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 |---|---|
 | Async runtime | None — `io_uring` for the server accept loop, blocking threads for probes |
 | Memory baseline | ~500 KB RSS (server), ~300 KB RSS (probe) |
-| Hot-path allocations | Zero — `ryu`/`itoa` format into pre-allocated stack buffers |
+| Export allocations | Zero — `ryu`/`itoa` format into pre-allocated stack buffers |
 | Export reliability | Fire-and-forget; no retry, no queue — if Telegraf/Collectd is down, the probe skips |
 | Binary size | 370 KB stripped (fat LTO, `panic = "abort"`, `strip = true`) |
 
@@ -237,15 +238,15 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 Including a standard async runtime (like `tokio`) imposes an unacceptable baseline memory footprint (2–5 MB RSS) and scheduler overhead for a binary whose sole purpose is handling socket file descriptors.
 
-- **Server mode (`io_uring`):** The TCP accept/drop loop is delegated directly to the Linux kernel's asynchronous submission/completion queues. By eliminating userland context-switching, the daemon maintains an RSS under ~500 KB regardless of inbound PPS rate.
-- **Probe mode (native blocking):** Relies on native blocking threads (`TcpStream::connect_timeout`) enforced by strict OS-level guards (`SO_RCVTIMEO` and `SO_SNDTIMEO`). This prevents socket deadlocks directly at the OS network ring, ensuring deterministic execution without instantiating reactive application-space timers.
+- **Server mode (`io_uring`):** The TCP accept loop is submitted to the Linux kernel's asynchronous submission/completion queues via `io_uring`. The daemon maintains an RSS under ~500 KB regardless of load because there are no per-connection allocations — accepted fds are closed immediately with a plain `libc::close`. Note: the current implementation uses a single outstanding accept (serial re-arm per connection); throughput is bounded by one `submit_and_wait` syscall per connection, which is sufficient for telemetry use but not for high-PPS scenarios.
+- **Probe mode (native blocking):** Uses `TcpStream::connect_timeout` on a blocking thread. The `--timeout` flag is the only timing bound — it maps directly to the OS-level connect timeout. The RTT is captured by `Instant::now()` around the connect call; no other mechanism is involved. DNS is resolved once at startup to avoid per-tick `getaddrinfo` blocking inside the measurement loop.
 
-### 2. Zero-Allocation Hot Path and Binary Density
+### 2. Zero-Allocation Export Path and Binary Density
 
-To guarantee the process runs entirely within the CPU's L1/L2 caches and avoids memory fragmentation during long-running execution, the binary is extremely dense.
+To guarantee the export hot path runs within the CPU's L1/L2 caches and avoids memory fragmentation during long-running execution, the binary is extremely dense.
 
-- Compiled statically via `musl-libc` with fat LTO and `panic = "abort"`, resulting in a ~370 KB stripped binary.
-- Heap allocations on the hot path are strictly forbidden. Telemetry formatting relies on direct stack-based buffer writing (`ryu` for floats, `itoa` for integers), bypassing the standard library's string formatting overhead entirely.
+- Compiled statically via `musl-libc` with fat LTO and `panic = "abort"`, producing a ~370 KB stripped binary (~500 KB RSS at runtime for the server, ~300 KB for the probe).
+- Heap allocations are eliminated on the **export** hot path: the metric prefix is built once at construction, the send buffer is reused via `clear()`, and `ryu`/`itoa` write directly into stack-allocated buffers with no `format!` or `String` intermediary.
 
 ### 3. Fire-and-Forget Export and Backpressure Offloading
 
@@ -256,9 +257,9 @@ An observability probe must never crash or block because the downstream telemetr
 
 ### 4. Pragmatic Collectd Integration
 
-Using collectd's standard `Exec` plugin to run a binary every 10 seconds creates cumulative CPU overhead due to continuous `fork`/`exec` system calls.
+Collectd's `Exec` plugin runs a child process once and reads its stdout in a long-lived loop — it does not re-fork per interval. The real cost it imposes is an out-of-process boundary: every read cycle crosses a pipe, a process boundary, and a shell.
 
-- To solve this, the project includes a native Python wrapper (`wire_probe.py`). Instead of spawning a new OS process per interval, the wrapper allows collectd's C runtime to handle the scheduling loop internally, bypassing OS-level process bootstrapping overhead while maintaining exact metric fidelity.
+- `wire_probe.py` is a full Python reimplementation of the probe logic (not a wrapper around the Rust binary). It registers directly with collectd's C runtime via the Python plugin API (`register_read` callback), running in-process with no child process at all. This eliminates the pipe/process boundary entirely. The trade-off: the Rust binary's musl, zero-alloc, and `io_uring` properties do not apply on this path — you get CPython doing blocking `socket.create_connection` calls. For collectd environments the in-process scheduling and drop-in `ping`/`ping_droprate`/`ping_stddev` metric names make it the right integration point.
 
 ## License
 

@@ -5,6 +5,7 @@ mod server;
 
 use cli::Mode;
 use exporter::Exporter;
+use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
@@ -29,6 +30,20 @@ fn main() {
             timeout,
             export,
         } => {
+            // Resolve once at startup. Per-tick getaddrinfo would run a blocking
+            // syscall every interval and corrupt cadence on slow/failing resolvers.
+            let addr = target
+                .to_socket_addrs()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: cannot resolve '{target}': {e}");
+                    std::process::exit(1);
+                })
+                .next()
+                .unwrap_or_else(|| {
+                    eprintln!("error: no address found for '{target}'");
+                    std::process::exit(1);
+                });
+
             let host = hostname();
             // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
             // CLI rejects values > 86400s and max(1.0) guarantees positive; casts are safe.
@@ -46,7 +61,7 @@ fn main() {
             loop {
                 let tick = Instant::now();
 
-                match probe::measure_rtt(&target, timeout) {
+                match probe::measure_rtt(&addr, timeout) {
                     Ok(rtt_ms) => {
                         // u64 nanoseconds wraps in year ~2554; safe for practical use.
                         #[allow(clippy::cast_possible_truncation)]

@@ -113,7 +113,7 @@ jobs:
     steps:
       - name: Install deps — Fedora / Rocky / Alma
         if: contains(fromJSON('["Fedora 40","Fedora 41","Rocky Linux 9","AlmaLinux 9"]'), matrix.label)
-        run: dnf install -y git curl gcc
+        run: dnf install -y --allowerasing git curl gcc glibc-devel
 
       - name: Install deps — Debian
         if: startsWith(matrix.label, 'Debian')

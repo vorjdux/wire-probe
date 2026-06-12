@@ -187,6 +187,12 @@ of collectd required.
 Install:
 
 ```bash
+curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install-plugin.sh | sudo sh
+```
+
+Or manually:
+
+```bash
 mkdir -p /usr/lib/collectd/wire_probe
 cp plugin/collectd/wire_probe.py /usr/lib/collectd/wire_probe/
 cp plugin/collectd/wire_probe.conf /etc/collectd/conf.d/

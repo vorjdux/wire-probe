@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::time::Duration;
 use pico_args::Arguments;
 
@@ -11,6 +12,7 @@ pub enum ExportDst {
 #[derive(Debug)]
 pub enum Mode {
     Server {
+        bind: String,
         port: u16,
     },
     Probe {
@@ -23,15 +25,21 @@ pub enum Mode {
     },
 }
 
+/// Maximum allowed probe interval (24 h). Prevents u32 overflow in interval_secs.
+const MAX_INTERVAL_MS: u64 = 86_400_000;
+
 pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
     let mut args = Arguments::from_env();
     let mode: String = args.value_from_str("--mode")?;
 
     match mode.as_str() {
         "server" => {
+            let bind: String = args
+                .opt_value_from_str("--bind")?
+                .unwrap_or_else(|| "127.0.0.1".to_string());
             let port: u16 = args.opt_value_from_str("--port")?.unwrap_or(9999);
             reject_unknown(args.finish())?;
-            Ok(Mode::Server { port })
+            Ok(Mode::Server { bind, port })
         }
         "probe" => {
             let target: String = args.value_from_str("--target")?;
@@ -54,6 +62,13 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "collectd-exec".to_string());
 
             let interval = parse_duration(&interval_str)?;
+            if interval.as_millis() as u64 > MAX_INTERVAL_MS {
+                return Err(format!(
+                    "interval too large (max {}ms = 24h)",
+                    MAX_INTERVAL_MS
+                )
+                .into());
+            }
             let timeout = parse_duration(&timeout_str)?;
             let export = parse_export(&export_str)?;
             reject_unknown(args.finish())?;
@@ -71,16 +86,24 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
     }
 }
 
-fn reject_unknown(leftover: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Error>> {
+fn reject_unknown(leftover: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(arg) = leftover.into_iter().next() {
         return Err(format!("unexpected argument: {}", arg.to_string_lossy()).into());
     }
     Ok(())
 }
 
-fn sanitize(s: &str) -> String {
+/// Strips characters that are unsafe in ILP tag values and PUTVAL identifiers.
+/// Keeps alphanumeric, hyphen, and dot; replaces everything else with `_`.
+pub fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -102,6 +125,9 @@ fn parse_export(s: &str) -> Result<ExportDst, Box<dyn std::error::Error>> {
     } else if s == "collectd-exec" {
         Ok(ExportDst::CollectdExec)
     } else {
-        Err(format!("unknown export scheme '{s}'; expected telegraf-udp://<addr>, collectd-uds://<path>, or collectd-exec").into())
+        Err(format!(
+            "unknown export scheme '{s}'; expected telegraf-udp://<addr>, collectd-uds://<path>, or collectd-exec"
+        )
+        .into())
     }
 }

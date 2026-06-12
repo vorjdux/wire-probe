@@ -1,9 +1,13 @@
 use io_uring::{opcode, types, IoUring};
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
+use std::time::Duration;
 
 const ACCEPT_TOKEN: u64 = 1;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Backoff between retries when a non-transient accept error occurs (e.g. EMFILE).
+/// Without this, a sustained error causes a hot spin that floods stderr and pegs the CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind_addr, port))?;
@@ -22,6 +26,12 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
   mode:    io_uring accept/drop loop
   author:  Matheus Santos <vorj.dux@gmail.com>"
     );
+    if bind_addr == "0.0.0.0" || bind_addr == "::" {
+        eprintln!(
+            "warn: listening on all interfaces — restrict with --bind <private-ip> \
+             or enforce access via firewall/NSG rules"
+        );
+    }
 
     loop {
         ring.submit_and_wait(1)?;
@@ -39,11 +49,13 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
                         }
                     } else {
                         // Negative result means the accept syscall failed.
-                        // Log anything other than EAGAIN/EWOULDBLOCK so a sustained
-                        // error (e.g. EMFILE — fd table exhausted) is visible.
                         let errno = -fd;
                         if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                            // Non-transient error (e.g. EMFILE — fd table exhausted).
+                            // Log once and sleep so a sustained failure neither hot-spins
+                            // the CPU nor floods stderr with one line per connection.
                             eprintln!("warn: accept error: {}", std::io::Error::from_raw_os_error(errno));
+                            std::thread::sleep(ACCEPT_ERROR_BACKOFF);
                         }
                     }
                     rearm = true;

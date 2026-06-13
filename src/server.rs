@@ -20,7 +20,7 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
 
     let pid = unsafe { libc::getpid() };
     eprintln!(
-        "wire-probe {VERSION} — L4 TCP telemetry server
+        "wire-probe {VERSION}  -  L4 TCP telemetry server
   pid:     {pid}
   listen:  {bind_addr}:{port}
   mode:    io_uring accept/drop loop
@@ -28,7 +28,7 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
     );
     if bind_addr == "0.0.0.0" || bind_addr == "::" {
         eprintln!(
-            "warn: listening on all interfaces — restrict with --bind <private-ip> \
+            "warn: listening on all interfaces  -  restrict with --bind <private-ip> \
              or enforce access via firewall/NSG rules"
         );
     }
@@ -51,7 +51,7 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
                         // Negative result means the accept syscall failed.
                         let errno = -fd;
                         if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
-                            // Non-transient error (e.g. EMFILE — fd table exhausted).
+                            // Non-transient error (e.g. EMFILE  -  fd table exhausted).
                             // Log once and sleep so a sustained failure neither hot-spins
                             // the CPU nor floods stderr with one line per connection.
                             eprintln!("warn: accept error: {}", std::io::Error::from_raw_os_error(errno));

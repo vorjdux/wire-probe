@@ -53,7 +53,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   SHA256_CMD="shasum -a 256"
 else
-  warn "sha256sum/shasum not found — skipping checksum verification"
+  warn "sha256sum/shasum not found  -  skipping checksum verification"
   SHA256_CMD=""
 fi
 
@@ -61,7 +61,7 @@ fi
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$OS" in
   linux)  OS="linux" ;;
-  *)      die "unsupported OS '$OS' — only Linux is supported" ;;
+  *)      die "unsupported OS '$OS'  -  only Linux is supported" ;;
 esac
 
 ARCH=$(uname -m)
@@ -124,10 +124,10 @@ if [ -n "$SHA256_CMD" ]; then
   actual:   ${ACTUAL}"
       ok "checksum verified"
     else
-      warn "archive not found in SHA256SUMS — skipping"
+      warn "archive not found in SHA256SUMS  -  skipping"
     fi
   else
-    warn "SHA256SUMS not available — skipping checksum"
+    warn "SHA256SUMS not available  -  skipping checksum"
   fi
 fi
 
@@ -152,4 +152,4 @@ if [ "$NO_MODIFY_PATH" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
   esac
 fi
 
-ok "Done — run: ${BINARY} --mode server --port 9999"
+ok "Done  -  run: ${BINARY} --mode server --port 9999"

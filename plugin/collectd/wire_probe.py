@@ -1,5 +1,5 @@
 """
-wire_probe.py — collectd plugin: TCP-handshake RTT, drop-rate, and stddev.
+wire_probe.py  -  collectd plugin: TCP-handshake RTT, drop-rate, and stddev.
 
 Mirrors the collectd ping plugin but uses TCP connect() (L4) instead of ICMP.
 Reuses the same value types so existing ping dashboards and thresholds work

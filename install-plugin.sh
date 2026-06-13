@@ -69,7 +69,7 @@ ok "installed ${PLUGIN_DIR}/wire_probe.py"
 
 # ── Install example config (only if absent) ────────────────────────────────
 if [ -f "${CONF_DIR}/wire_probe.conf" ]; then
-  warn "${CONF_DIR}/wire_probe.conf already exists — not overwriting"
+  warn "${CONF_DIR}/wire_probe.conf already exists  -  not overwriting"
 else
   mkdir -p "$CONF_DIR"
   curl --proto '=https' --tlsv1.2 -sfL \
@@ -86,8 +86,8 @@ if [ -z "${NO_RELOAD:-}" ]; then
     systemctl reload collectd
     ok "collectd reloaded"
   else
-    warn "collectd does not appear to be running — start it manually when ready"
+    warn "collectd does not appear to be running  -  start it manually when ready"
   fi
 fi
 
-ok "Done — see ${CONF_DIR}/wire_probe.conf to configure target hosts"
+ok "Done  -  see ${CONF_DIR}/wire_probe.conf to configure target hosts"

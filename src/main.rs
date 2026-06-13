@@ -87,7 +87,7 @@ fn main() {
 
 fn hostname() -> String {
     // HOST_NAME_MAX is 255 on Linux; +1 for the null terminator.
-    // gethostname(3) truncates to `size` bytes — with a zeroed buffer of 256
+    // gethostname(3) truncates to `size` bytes  -  with a zeroed buffer of 256
     // the result is always null-terminated even if the name is exactly 255 chars.
     let mut buf = [0u8; 256];
     unsafe {

@@ -1,6 +1,6 @@
 # wire-probe
 
-> Zero-footprint L4 telemetry agent — TCP handshake RTT, sub-1 MB RAM, no runtime deps.
+> Zero-footprint L4 telemetry agent  -  TCP handshake RTT, sub-1 MB RAM, no runtime deps.
 
 [![CI](https://github.com/vorjdux/wire-probe/actions/workflows/ci.yml/badge.svg)](https://github.com/vorjdux/wire-probe/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -9,16 +9,16 @@
 ## Why
 
 ICMP ping is blocked by most firewalls and tells you nothing about the TCP stack.
-`wire-probe` measures the time for a full TCP three-way handshake — the same
-latency a real client sees — with no kernel module, no eBPF, no agent framework.
+`wire-probe` measures the time for a full TCP three-way handshake  -  the same
+latency a real client sees  -  with no kernel module, no eBPF, no agent framework.
 
-- **Server mode** — `io_uring` accept/drop loop; accepts SYNs and immediately
+- **Server mode**  -  `io_uring` accept/drop loop; accepts SYNs and immediately
   closes them, consuming ~500 KB RSS at any connection rate
-- **Probe mode** — blocking `TcpStream::connect_timeout` wrapped with
+- **Probe mode**  -  blocking `TcpStream::connect_timeout` wrapped with
   `std::time::Instant`; the `--timeout` flag is the only timing bound
-- **Fire-and-forget export** — UDP (Telegraf Influx Line Protocol) or Unix
+- **Fire-and-forget export**  -  UDP (Telegraf Influx Line Protocol) or Unix
   domain socket / stdout (Collectd PUTVAL); no buffering, no retries
-- **Single static binary** — musl-linked, 370 KB stripped, zero glibc version
+- **Single static binary**  -  musl-linked, 370 KB stripped, zero glibc version
   dependency, works on Ubuntu, Fedora, Debian, RHEL, Alpine and any other Linux
 
 ## Install
@@ -80,7 +80,7 @@ wire-probe --mode probe \
 ### Server mode
 
 Runs as a resident daemon on the target host. Uses an `io_uring` accept/drop
-loop — accepts each TCP SYN and immediately closes the socket without reading
+loop  -  accepts each TCP SYN and immediately closes the socket without reading
 any data. No thread is spawned per connection.
 
 ```
@@ -96,7 +96,7 @@ wire-probe --mode server [--port <port>] [--bind <addr>]
 
 Runs on the observer host. Measures the TCP handshake RTT to the target and
 exports the result on every interval. The target address is resolved once at
-startup — use an IP address if DNS reliability on your network is a concern.
+startup  -  use an IP address if DNS reliability on your network is a concern.
 
 ```
 wire-probe --mode probe --target <host:port> [options]
@@ -113,7 +113,7 @@ wire-probe --mode probe --target <host:port> [options]
 
 ## Export targets
 
-### Telegraf — Influx Line Protocol over UDP
+### Telegraf  -  Influx Line Protocol over UDP
 
 ```
 --export telegraf-udp://<host>:<port>
@@ -133,7 +133,7 @@ Telegraf configuration:
   data_format     = "influx"
 ```
 
-### Collectd — PUTVAL
+### Collectd  -  PUTVAL
 
 #### Exec plugin (stdout)
 
@@ -170,7 +170,7 @@ Streams `PUTVAL` lines directly to collectd's
 
 ## Collectd Python plugin
 
-A drop-in replacement for collectd's `ping` plugin — same config syntax,
+A drop-in replacement for collectd's `ping` plugin  -  same config syntax,
 same metric names (`ping`, `ping_droprate`, `ping_stddev`), no recompilation
 of collectd required.
 
@@ -225,10 +225,10 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 | Concern | Decision |
 |---|---|
-| Async runtime | None — `io_uring` for the server accept loop, blocking threads for probes |
+| Async runtime | None  -  `io_uring` for the server accept loop, blocking threads for probes |
 | Memory baseline | ~500 KB RSS (server), ~300 KB RSS (probe) |
-| Export allocations | Zero — `ryu`/`itoa` format into pre-allocated stack buffers |
-| Export reliability | Fire-and-forget; no retry, no queue — if Telegraf/Collectd is down, the probe skips |
+| Export allocations | Zero  -  `ryu`/`itoa` format into pre-allocated stack buffers |
+| Export reliability | Fire-and-forget; no retry, no queue  -  if Telegraf/Collectd is down, the probe skips |
 | Binary size | 370 KB stripped (fat LTO, `panic = "abort"`, `strip = true`) |
 
 ## Behind the Design
@@ -239,8 +239,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 Including a standard async runtime (like `tokio`) imposes an unacceptable baseline memory footprint (2–5 MB RSS) and scheduler overhead for a binary whose sole purpose is handling socket file descriptors.
 
-- **Server mode (`io_uring`):** The TCP accept loop is submitted to the Linux kernel's asynchronous submission/completion queues via `io_uring`. The daemon maintains an RSS under ~500 KB regardless of load because there are no per-connection allocations — accepted fds are closed immediately with a plain `libc::close`. Note: the current implementation uses a single outstanding accept (serial re-arm per connection); throughput is bounded by one `submit_and_wait` syscall per connection, which is sufficient for telemetry use but not for high-PPS scenarios.
-- **Probe mode (native blocking):** Uses `TcpStream::connect_timeout` on a blocking thread. The `--timeout` flag is the only timing bound — it maps directly to the OS-level connect timeout. The RTT is captured by `Instant::now()` around the connect call; no other mechanism is involved. DNS is resolved once at startup to avoid per-tick `getaddrinfo` blocking inside the measurement loop.
+- **Server mode (`io_uring`):** The TCP accept loop is submitted to the Linux kernel's asynchronous submission/completion queues via `io_uring`. The daemon maintains an RSS under ~500 KB regardless of load because there are no per-connection allocations  -  accepted fds are closed immediately with a plain `libc::close`. Note: the current implementation uses a single outstanding accept (serial re-arm per connection); throughput is bounded by one `submit_and_wait` syscall per connection, which is sufficient for telemetry use but not for high-PPS scenarios.
+- **Probe mode (native blocking):** Uses `TcpStream::connect_timeout` on a blocking thread. The `--timeout` flag is the only timing bound  -  it maps directly to the OS-level connect timeout. The RTT is captured by `Instant::now()` around the connect call; no other mechanism is involved. DNS is resolved once at startup to avoid per-tick `getaddrinfo` blocking inside the measurement loop.
 
 ### 2. Zero-Allocation Export Path and Binary Density
 
@@ -258,10 +258,10 @@ An observability probe must never crash or block because the downstream telemetr
 
 ### 4. Pragmatic Collectd Integration
 
-Collectd's `Exec` plugin runs a child process once and reads its stdout in a long-lived loop — it does not re-fork per interval. The real cost it imposes is an out-of-process boundary: every read cycle crosses a pipe, a process boundary, and a shell.
+Collectd's `Exec` plugin runs a child process once and reads its stdout in a long-lived loop  -  it does not re-fork per interval. The real cost it imposes is an out-of-process boundary: every read cycle crosses a pipe, a process boundary, and a shell.
 
-- `wire_probe.py` is a full Python reimplementation of the probe logic (not a wrapper around the Rust binary). It registers directly with collectd's C runtime via the Python plugin API (`register_read` callback), running in-process with no child process at all. This eliminates the pipe/process boundary entirely. The trade-off: the Rust binary's musl, zero-alloc, and `io_uring` properties do not apply on this path — you get CPython doing blocking `socket.create_connection` calls. For collectd environments the in-process scheduling and drop-in `ping`/`ping_droprate`/`ping_stddev` metric names make it the right integration point.
+- `wire_probe.py` is a full Python reimplementation of the probe logic (not a wrapper around the Rust binary). It registers directly with collectd's C runtime via the Python plugin API (`register_read` callback), running in-process with no child process at all. This eliminates the pipe/process boundary entirely. The trade-off: the Rust binary's musl, zero-alloc, and `io_uring` properties do not apply on this path  -  you get CPython doing blocking `socket.create_connection` calls. For collectd environments the in-process scheduling and drop-in `ping`/`ping_droprate`/`ping_stddev` metric names make it the right integration point.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT  -  see [LICENSE](LICENSE).

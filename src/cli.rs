@@ -36,7 +36,7 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 
 pub fn print_help() {
     eprintln!(
-        "wire-probe {VERSION} — zero-footprint L4 TCP telemetry agent
+        "wire-probe {VERSION}  -  zero-footprint L4 TCP telemetry agent
 Author: Matheus Santos <vorj.dux@gmail.com>
 License: MIT  |  https://github.com/vorjdux/wire-probe
 

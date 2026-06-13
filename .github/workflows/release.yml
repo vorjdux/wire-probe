@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Static musl builds — tarball works on ANY Linux distro, any glibc version
+# Static musl builds  -  tarball works on ANY Linux distro, any glibc version
 # ──────────────────────────────────────────────────────────────────────────────
 jobs:
   build-static:
@@ -67,7 +67,7 @@ jobs:
           if-no-files-found: error
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Native glibc builds — distro-specific tarballs
+  # Native glibc builds  -  distro-specific tarballs
   # ──────────────────────────────────────────────────────────────────────────
   build-distro:
     name: ${{ matrix.label }}
@@ -113,11 +113,11 @@ jobs:
             os_slug: almalinux9
 
     steps:
-      - name: Install deps — Fedora / Rocky / Alma
+      - name: Install deps  -  Fedora / Rocky / Alma
         if: contains(fromJSON('["Fedora 40","Fedora 41","Rocky Linux 9","AlmaLinux 9"]'), matrix.label)
         run: dnf install -y --allowerasing git curl gcc glibc-devel
 
-      - name: Install deps — Debian
+      - name: Install deps  -  Debian
         if: startsWith(matrix.label, 'Debian')
         run: apt-get update -qq && apt-get install -y --no-install-recommends git curl gcc libc-dev ca-certificates
 
@@ -205,7 +205,7 @@ jobs:
           PRERELEASE=""
           [[ "$TAG" == *-* ]] && PRERELEASE="--prerelease"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — uploading/updating assets."
+            echo "Release $TAG already exists  -  uploading/updating assets."
             gh release upload "$TAG" dist/* --clobber
             gh release edit "$TAG" \
               --title "wire-probe ${VER}" \

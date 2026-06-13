@@ -40,14 +40,14 @@ jobs:
             && echo "OK: statically linked" \
             || (echo "FAIL: unexpected dynamic linkage" && exit 1)
 
-      - name: Smoke test — server starts
+      - name: Smoke test  -  server starts
         run: |
           ./target/x86_64-unknown-linux-musl/release/wire-probe \
             --mode server --port 19999 &
           sleep 0.3
           kill %1
 
-      - name: Smoke test — probe fails cleanly on refused port
+      - name: Smoke test  -  probe fails cleanly on refused port
         run: |
           ./target/x86_64-unknown-linux-musl/release/wire-probe \
             --mode probe --target 127.0.0.1:1 \
@@ -55,7 +55,7 @@ jobs:
             --export collectd-exec 2>&1 | grep -q "probe error" \
             && echo "OK" || (echo "FAIL: expected probe error" && exit 1)
 
-      - name: Smoke test — package tarball
+      - name: Smoke test  -  package tarball
         run: |
           DIR="wire-probe-ci-linux-x86_64"
           mkdir "$DIR"

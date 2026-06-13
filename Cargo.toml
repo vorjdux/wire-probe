@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2021"
 
 [dependencies]
-io-uring = "0.6"
+io-uring = "0.7"
 pico-args = "0.5"
 itoa = "1.0"
 ryu = "1.0"

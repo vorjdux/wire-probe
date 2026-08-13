@@ -39,15 +39,38 @@ def _valid_port(port):
     return 1 <= port <= 65535
 
 
-def _tcp_rtt(host, port, timeout):
-    """Return RTT in milliseconds, or None on connection failure."""
+def _resolve(host, port):
+    """Return (family, sockaddr) for the first address, or None on failure.
+
+    Resolution is deliberately kept OUT of the timed section: socket.
+    create_connection() would fold getaddrinfo() into the measurement, so a
+    cold DNS lookup shows up as multi-second "RTT" on the first read cycle.
+    Only the first address is used, mirroring the Rust probe (to_socket_addrs
+    followed by .next()).
+    """
     try:
-        t0 = time.monotonic()
-        with socket.create_connection((host, port), timeout=timeout):
-            pass
-        return (time.monotonic() - t0) * 1_000.0
-    except Exception:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
         return None
+    if not infos:
+        return None
+    family, _, _, _, sockaddr = infos[0]
+    return family, sockaddr
+
+
+def _tcp_rtt(addr_info, timeout):
+    """Return TCP handshake RTT in milliseconds, or None on failure."""
+    family, sockaddr = addr_info
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        t0 = time.monotonic()
+        sock.connect(sockaddr)
+        return (time.monotonic() - t0) * 1_000.0
+    except OSError:
+        return None
+    finally:
+        sock.close()
 
 
 def _emit(type_instance, value_type, value):
@@ -137,13 +160,21 @@ def read_cb():
     for display, hostname, host_port in _hosts:
         port = host_port if host_port is not None else default_port
 
+        # Resolved once per read cycle, outside the timed section, and reused
+        # for every sample. A resolution failure counts as a full drop.
+        addr_info = _resolve(hostname, port)
+        if addr_info is None:
+            collectd.warning(f"{PLUGIN_NAME}: cannot resolve '{hostname}', counting as drop")
+
         samples = []
         for _ in range(ping_count):
+            if addr_info is None:
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 collectd.warning(f"{PLUGIN_NAME}: read budget exhausted, skipping remaining probes")
                 break
-            rtt = _tcp_rtt(hostname, port, min(timeout, remaining))
+            rtt = _tcp_rtt(addr_info, min(timeout, remaining))
             if rtt is not None:
                 samples.append(rtt)
 

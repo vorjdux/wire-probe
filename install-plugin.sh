@@ -7,7 +7,8 @@
 # Environment overrides:
 #   PLUGIN_DIR=/usr/lib/collectd/wire_probe   override plugin install directory
 #   CONF_DIR=/etc/collectd/conf.d             override collectd config drop-in directory
-#   NO_RELOAD=1                               skip 'systemctl reload collectd'
+#   NO_RESTART=1                              skip 'systemctl restart collectd'
+#                                             (NO_RELOAD=1 also accepted)
 #   NO_COLOR=1                                disable coloured output
 set -e
 
@@ -38,7 +39,7 @@ for arg in "$@"; do
       echo "Environment variables:"
       echo "  PLUGIN_DIR=/path    directory to install wire_probe.py"
       echo "  CONF_DIR=/path      collectd conf.d directory"
-      echo "  NO_RELOAD=1         skip systemctl reload collectd"
+      echo "  NO_RESTART=1        skip systemctl restart collectd"
       exit 0 ;;
   esac
 done
@@ -77,14 +78,17 @@ else
     -o "${CONF_DIR}/wire_probe.conf" \
     || die "failed to download wire_probe.conf"
   ok "installed ${CONF_DIR}/wire_probe.conf"
-  warn "Edit ${CONF_DIR}/wire_probe.conf to set your target hosts, then reload collectd"
+  warn "Edit ${CONF_DIR}/wire_probe.conf to set your target hosts, then: systemctl restart collectd"
+  FRESH_CONF=1
 fi
 
-# ── Reload collectd ────────────────────────────────────────────────────────
-if [ -z "${NO_RELOAD:-}" ]; then
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet collectd 2>/dev/null; then
-    systemctl reload collectd
-    ok "collectd reloaded"
+# ── Restart collectd (it has no 'reload'; systemd rejects reload jobs) ──────
+if [ -z "${NO_RESTART:-${NO_RELOAD:-}}" ]; then
+  if [ "${FRESH_CONF:-0}" = "1" ]; then
+    warn "skipping restart  -  edit the config first, then: systemctl restart collectd"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet collectd 2>/dev/null; then
+    systemctl restart collectd
+    ok "collectd restarted"
   else
     warn "collectd does not appear to be running  -  start it manually when ready"
   fi

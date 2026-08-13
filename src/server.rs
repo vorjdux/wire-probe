@@ -11,19 +11,37 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind_addr, port))?;
-    let listener_fd = listener.as_raw_fd();
 
-    let mut ring = IoUring::new(256)?;
-
-    push_accept(&mut ring, listener_fd)?;
-    ring.submit()?;
+    // io_uring is unavailable in plenty of real deployments: seccomp profiles
+    // in hardened containers, Kubernetes PSPs, kernels older than 5.1, or
+    // io_uring_disabled=2. For a loop that only accepts and closes, blocking
+    // accept4() is an adequate substitute, so degrade instead of refusing to
+    // start. Errors that are not about availability still propagate.
+    let ring = match IoUring::new(256) {
+        Ok(ring) => Some(ring),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP)
+            ) =>
+        {
+            eprintln!("warn: io_uring unavailable ({e})  -  falling back to blocking accept");
+            None
+        }
+        Err(e) => return Err(e),
+    };
 
     let pid = unsafe { libc::getpid() };
+    let mode = if ring.is_some() {
+        "io_uring accept/drop loop"
+    } else {
+        "blocking accept/drop loop (io_uring unavailable)"
+    };
     eprintln!(
         "wire-probe {VERSION}  -  L4 TCP telemetry server
   pid:     {pid}
   listen:  {bind_addr}:{port}
-  mode:    io_uring accept/drop loop
+  mode:    {mode}
   author:  Matheus Santos <vorj.dux@gmail.com>"
     );
     if bind_addr == "0.0.0.0" || bind_addr == "::" {
@@ -32,6 +50,36 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
              or enforce access via firewall/NSG rules"
         );
     }
+
+    match ring {
+        Some(ring) => run_io_uring(&listener, ring),
+        None => run_blocking(&listener),
+    }
+}
+
+/// Blocking fallback. `TcpListener::accept` uses accept4(SOCK_CLOEXEC) on
+/// Linux, so accepted fds do not leak into children here either. The stream is
+/// dropped immediately, which closes it.
+fn run_blocking(listener: &TcpListener) -> std::io::Result<()> {
+    loop {
+        match listener.accept() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                // Same reasoning as the io_uring path: back off so a sustained
+                // failure (EMFILE) neither hot-spins nor floods stderr.
+                eprintln!("warn: accept error: {e}");
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+            }
+        }
+    }
+}
+
+fn run_io_uring(listener: &TcpListener, mut ring: IoUring) -> std::io::Result<()> {
+    let listener_fd = listener.as_raw_fd();
+
+    push_accept(&mut ring, listener_fd)?;
+    ring.submit()?;
 
     loop {
         ring.submit_and_wait(1)?;

@@ -86,6 +86,56 @@ def _tcp_rtt(addr_info, timeout):
         sock.close()
 
 
+def _split_host_port(raw):
+    """Split a Host value into (hostname, port-or-None).
+
+    Accepted forms:
+      hostname            hostname:port
+      192.0.2.1           192.0.2.1:9999
+      ::1                 [::1]:9999          [::1]
+
+    Bare IPv6 literals must NOT be split on the last colon: "::1" would
+    otherwise become host ":" port 1, which resolves to something unrelated
+    without ever warning. Brackets are stripped because getaddrinfo() wants
+    the address, not the bracketed URL form.
+    """
+    if raw.startswith("["):
+        addr, sep, rest = raw.partition("]")
+        host = addr[1:]
+        if not sep:
+            collectd.warning(f"{PLUGIN_NAME}: unbalanced '[' in Host '{raw}'")
+            return raw, None
+        if rest.startswith(":"):
+            return host, _parse_port(rest[1:], raw)
+        return host, None
+
+    # Two or more colons means a bare IPv6 literal, which carries no port.
+    if raw.count(":") >= 2:
+        return raw, None
+
+    if ":" in raw:
+        host, _, port_str = raw.rpartition(":")
+        return host, _parse_port(port_str, raw)
+
+    return raw, None
+
+
+def _parse_port(port_str, raw):
+    """Parse an inline port, or None (falling back to the global Port)."""
+    try:
+        port = int(port_str)
+    except ValueError:
+        collectd.warning(f"{PLUGIN_NAME}: non-numeric port in Host '{raw}', using default port")
+        return None
+    if not _valid_port(port):
+        collectd.warning(
+            f"{PLUGIN_NAME}: inline port {port} in '{raw}' "
+            f"out of range [1, 65535], using default port"
+        )
+        return None
+    return port
+
+
 def _emit(type_instance, value_type, value):
     v = collectd.Values()
     v.plugin = PLUGIN_NAME
@@ -107,24 +157,7 @@ def config_cb(conf):
 
         if key == "host":
             raw = node.values[0]
-            # Support "hostname:port" inline override
-            if ":" in raw and not raw.startswith("["):
-                # plain IPv4 host:port  (IPv6 literals would be [::1]:port)
-                parts = raw.rsplit(":", 1)
-                try:
-                    inline_port = int(parts[1])
-                    if not _valid_port(inline_port):
-                        collectd.warning(
-                            f"{PLUGIN_NAME}: inline port {inline_port} in '{raw}' "
-                            f"out of range [1, 65535], using default port"
-                        )
-                        hostname, port = parts[0], None
-                    else:
-                        hostname, port = parts[0], inline_port
-                except ValueError:
-                    hostname, port = raw, None  # resolve port later
-            else:
-                hostname, port = raw, None
+            hostname, port = _split_host_port(raw)
             # De-duplicate rather than reset the list: collectd calls this once
             # per <Module wire_probe> block, so clearing would discard all but
             # the last block, while blind appending probes a repeated target
@@ -178,8 +211,21 @@ def read_cb():
     # callback never blocks collectd's read thread for most of its Interval.
     deadline = time.monotonic() + _read_budget()
 
-    for display, hostname, host_port in _hosts:
+    for _display, hostname, host_port in _hosts:
         port = host_port if host_port is not None else default_port
+
+        # An explicit per-host port has to reach the series name, otherwise
+        # "db:5432" and "db:9999" both dispatch as type_instance "db" and
+        # overwrite each other. Hosts on the global Port keep the bare
+        # hostname, so existing series are unaffected.
+        label = hostname if host_port is None else f"{hostname}_{port}"
+
+        # Resolving costs wall-clock too, so honour the deadline before paying
+        # for it: getaddrinfo() takes no timeout argument and a stuck resolver
+        # would otherwise blow the budget no matter what the connect loop does.
+        if time.monotonic() >= deadline:
+            collectd.warning(f"{PLUGIN_NAME}: read budget exhausted, skipping '{label}'")
+            break
 
         # Resolved once per read cycle, outside the timed section, and reused
         # for every sample. A resolution failure counts as a full drop.
@@ -213,10 +259,11 @@ def read_cb():
             avg = float("nan")
             stddev = float("nan")
 
-        # type_instance mirrors the ping plugin: bare hostname (no port)
-        _emit(hostname, "ping", avg)
-        _emit(hostname, "ping_droprate", droprate)
-        _emit(hostname, "ping_stddev", stddev)
+        # type_instance mirrors the ping plugin: bare hostname, plus the port
+        # only where one was set per-host (see `label` above).
+        _emit(label, "ping", avg)
+        _emit(label, "ping_droprate", droprate)
+        _emit(label, "ping_stddev", stddev)
 
 
 collectd.register_config(config_cb)

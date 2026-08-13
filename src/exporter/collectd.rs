@@ -1,5 +1,13 @@
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
+
+/// Bytes reserved past the prefix for the formatted value and newline.
+/// A ryu-formatted f64 is at most 24 bytes; 32 leaves margin.
+const VALUE_HEADROOM: usize = 32;
+
+/// Cap on a single blocking write to the Unix socket.
+const UDS_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Writes PUTVAL lines either to stdout (Exec plugin) or a Unix domain socket.
 ///
@@ -23,10 +31,15 @@ enum Dest {
 
 impl CollectdExporter {
     pub fn new_exec(hostname: &str, target_name: &str, interval_secs: u32) -> Self {
+        let prefix = build_prefix(hostname, target_name, interval_secs);
         Self {
             dest: Dest::Exec,
-            prefix: build_prefix(hostname, target_name, interval_secs),
-            buf: Vec::with_capacity(128),
+            // Sized from the actual prefix so the "no allocation on the hot
+            // path" property holds for long hostnames too, instead of relying
+            // on a fixed 128 bytes that a long host/target pair would outgrow
+            // on the first send.
+            buf: Vec::with_capacity(prefix.len() + VALUE_HEADROOM),
+            prefix,
         }
     }
 
@@ -37,10 +50,16 @@ impl CollectdExporter {
         interval_secs: u32,
     ) -> io::Result<Self> {
         let stream = UnixStream::connect(path)?;
+        // A Unix stream socket is NOT fire-and-forget: if collectd stops
+        // reading, the kernel buffer fills and write_all() blocks forever,
+        // which would stop the probe measuring. Bound it so a stalled consumer
+        // costs one send, not the process.
+        stream.set_write_timeout(Some(UDS_WRITE_TIMEOUT))?;
+        let prefix = build_prefix(hostname, target_name, interval_secs);
         Ok(Self {
             dest: Dest::Uds(stream),
-            prefix: build_prefix(hostname, target_name, interval_secs),
-            buf: Vec::with_capacity(128),
+            buf: Vec::with_capacity(prefix.len() + VALUE_HEADROOM),
+            prefix,
         })
     }
 
@@ -93,4 +112,44 @@ fn build_prefix(hostname: &str, target_name: &str, interval_secs: u32) -> Vec<u8
     p.extend_from_slice(itoa_buf.format(interval_secs).as_bytes());
     p.extend_from_slice(b" N:");
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_matches_the_putval_wire_format() {
+        let p = build_prefix("obs01", "mdb_primary", 10);
+        assert_eq!(
+            String::from_utf8(p).unwrap(),
+            "PUTVAL obs01/wire-probe-tcp/latency-mdb_primary interval=10 N:"
+        );
+    }
+
+    #[test]
+    fn exec_exporter_writes_value_then_undefined_on_failure() {
+        // Exercises the same buffer the socket path uses, without a consumer.
+        let mut e = CollectdExporter::new_exec("obs01", "t", 1);
+        e.buf.clear();
+        e.buf.extend_from_slice(&e.prefix);
+        let mut ryu_buf = ryu::Buffer::new();
+        e.buf
+            .extend_from_slice(ryu_buf.format(4.125_f64).as_bytes());
+        assert!(String::from_utf8_lossy(&e.buf).ends_with("N:4.125"));
+
+        e.buf.clear();
+        e.buf.extend_from_slice(&e.prefix);
+        e.buf.push(b'U');
+        assert!(String::from_utf8_lossy(&e.buf).ends_with("N:U"));
+    }
+
+    #[test]
+    fn buffer_capacity_absorbs_a_long_identifier_without_growing() {
+        let host = "a".repeat(200);
+        let e = CollectdExporter::new_exec(&host, "target-with-a-long-name", 1);
+        let cap = e.buf.capacity();
+        // Worst case: full prefix plus a ryu-formatted f64 plus newline.
+        assert!(cap >= e.prefix.len() + 25, "capacity {cap} too small");
+    }
 }

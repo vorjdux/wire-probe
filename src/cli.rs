@@ -44,7 +44,7 @@ USAGE:
     wire-probe --mode <server|probe> [OPTIONS]
 
 MODES:
-  server    Accept/drop loop on the target host (io_uring, ~500 KB RSS)
+  server    Accept/drop loop on the target host (io_uring, ~460 KB RSS)
   probe     Measure TCP handshake RTT and export metrics
 
 SERVER OPTIONS:

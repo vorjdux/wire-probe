@@ -30,19 +30,13 @@ fn main() {
             timeout,
             export,
         } => {
-            // Resolve once at startup. Per-tick getaddrinfo would run a blocking
-            // syscall every interval and corrupt cadence on slow/failing resolvers.
-            let addr = target
-                .to_socket_addrs()
-                .unwrap_or_else(|e| {
-                    eprintln!("error: cannot resolve '{target}': {e}");
-                    std::process::exit(1);
-                })
-                .next()
-                .unwrap_or_else(|| {
-                    eprintln!("error: no address found for '{target}'");
-                    std::process::exit(1);
-                });
+            // Resolve outside the timed section: a per-tick getaddrinfo is a
+            // blocking syscall that would corrupt cadence on a slow resolver,
+            // and folding it into the measurement reports DNS as RTT.
+            let mut addr = resolve(&target).unwrap_or_else(|e| {
+                eprintln!("error: cannot resolve '{target}': {e}");
+                std::process::exit(1);
+            });
 
             let host = hostname();
             // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
@@ -58,6 +52,7 @@ fn main() {
 
             // Latched so a flapping target does not repeat the warning forever.
             let mut overran = false;
+            let mut consecutive_failures: u32 = 0;
 
             loop {
                 let tick = Instant::now();
@@ -70,9 +65,29 @@ fn main() {
                     .as_nanos() as u64;
 
                 let sent = match probe::measure_rtt(&addr, timeout) {
-                    Ok(rtt_ms) => exp.send(rtt_ms, ts_ns),
+                    Ok(rtt_ms) => {
+                        consecutive_failures = 0;
+                        exp.send(rtt_ms, ts_ns)
+                    }
                     Err(e) => {
                         eprintln!("probe error: {e}");
+                        consecutive_failures += 1;
+                        // Resolving once at startup pins the process to one
+                        // address for its whole life: a DNS-based failover, or
+                        // a first answer that is an unreachable AAAA, would
+                        // never be picked up. Re-resolve after a run of
+                        // failures  -  still outside the timed section, and only
+                        // when the current address is not working anyway.
+                        if consecutive_failures % RERESOLVE_AFTER_FAILURES == 0 {
+                            match resolve(&target) {
+                                Ok(new_addr) if new_addr != addr => {
+                                    eprintln!("info: '{target}' now resolves to {new_addr}");
+                                    addr = new_addr;
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("warning: re-resolving '{target}' failed: {e}"),
+                            }
+                        }
                         exp.send_failure(ts_ns)
                     }
                 };
@@ -103,6 +118,18 @@ fn main() {
             }
         }
     }
+}
+
+/// Consecutive probe failures before the target is resolved again.
+const RERESOLVE_AFTER_FAILURES: u32 = 5;
+
+fn resolve(target: &str) -> std::io::Result<std::net::SocketAddr> {
+    target.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no address found for '{target}'"),
+        )
+    })
 }
 
 fn hostname() -> String {

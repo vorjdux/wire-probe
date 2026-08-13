@@ -38,11 +38,13 @@ impl TelegrafExporter {
         self.buf.extend_from_slice(&self.prefix);
 
         let mut ryu_buf = ryu::Buffer::new();
-        self.buf.extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
+        self.buf
+            .extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
         self.buf.push(b' ');
 
         let mut itoa_buf = itoa::Buffer::new();
-        self.buf.extend_from_slice(itoa_buf.format(ts_ns).as_bytes());
+        self.buf
+            .extend_from_slice(itoa_buf.format(ts_ns).as_bytes());
         // ILP requires a newline terminator; Telegraf socket_listener rejects lines without it.
         self.buf.push(b'\n');
 

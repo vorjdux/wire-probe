@@ -1,6 +1,6 @@
+use pico_args::Arguments;
 use std::ffi::OsString;
 use std::time::Duration;
-use pico_args::Arguments;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

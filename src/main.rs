@@ -90,7 +90,8 @@ fn run_probe(
 
     // Latched so a flapping target does not repeat the warning forever.
     let mut overran = false;
-    let mut consecutive_failures: u32 = 0;
+    // Counts down to the next re-resolve; reset on every success.
+    let mut failures_until_reresolve: u32 = RERESOLVE_AFTER_FAILURES;
 
     loop {
         let tick = Instant::now();
@@ -105,18 +106,37 @@ fn run_probe(
             .unwrap_or(Duration::ZERO)
             .as_nanos() as u64;
 
-        let addr = addrs[addr_idx];
+        // get() rather than indexing: this is the hot loop of a process built
+        // with panic = "abort", so an index that ever went stale would kill
+        // the agent outright. The invariant is maintained by apply_resolution;
+        // this is the belt.
+        let addr = if let Some(&a) = addrs.get(addr_idx) {
+            a
+        } else {
+            // Reset and fall through to the first entry rather than
+            // `continue`: skipping to the next iteration would skip the sleep
+            // too, turning a broken invariant into a hot spin.
+            eprintln!("warning: address index went stale, resetting");
+            addr_idx = 0;
+            let Some(&first) = addrs.first() else {
+                eprintln!("error: no addresses left for '{target}'");
+                return;
+            };
+            first
+        };
         let sent = match probe::measure_rtt(&addr, timeout) {
             Ok(rtt_ms) => {
-                consecutive_failures = 0;
+                failures_until_reresolve = RERESOLVE_AFTER_FAILURES;
                 exp.send(rtt_ms, ts_ns)
             }
             Err(e) => {
                 eprintln!("probe error: {e}");
-                // Saturating: after ~4e9 consecutive failures a wrapping
-                // counter would reset the re-resolve cadence.
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures % RERESOLVE_AFTER_FAILURES == 0 {
+                // Counts down and resets rather than taking a modulo of a
+                // running total: no division, and no dependence on the counter
+                // never wrapping.
+                failures_until_reresolve = failures_until_reresolve.saturating_sub(1);
+                if failures_until_reresolve == 0 {
+                    failures_until_reresolve = RERESOLVE_AFTER_FAILURES;
                     rotate_target(target, &mut addrs, &mut addr_idx);
                 }
                 exp.send_failure(ts_ns)
@@ -176,10 +196,11 @@ fn rotate_target(target: &str, addrs: &mut Vec<std::net::SocketAddr>, addr_idx: 
     match resolve(target) {
         Ok(fresh) => match apply_resolution(addrs, addr_idx, fresh) {
             Rotation::Unchanged => {}
-            Rotation::NextAddress => eprintln!(
-                "info: trying the next address for '{target}': {}",
-                addrs[*addr_idx]
-            ),
+            Rotation::NextAddress => {
+                if let Some(addr) = addrs.get(*addr_idx) {
+                    eprintln!("info: trying the next address for '{target}': {addr}");
+                }
+            }
             Rotation::Replaced => {
                 eprintln!("info: '{target}' now resolves to {}", join_addrs(addrs));
             }
@@ -263,10 +284,18 @@ fn hostname() -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     // Sanitise: hostnames injected via orchestrators (k8s, cloud init) may
     // contain slashes, spaces, or other characters that break PUTVAL identifiers.
-    cli::sanitize(&String::from_utf8_lossy(&buf[..end]))
+    // get() over slicing: `end` comes from a position() on this same buffer,
+    // so it cannot be out of range, but slicing is the one panic left in a
+    // panic = "abort" binary and the fallback costs nothing.
+    let name = buf.get(..end).unwrap_or(&buf);
+    cli::sanitize(&String::from_utf8_lossy(name))
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "tests assert on known-shaped data; a panic here is a test failure, which is the point"
+)]
 mod tests {
     use super::*;
     use std::net::SocketAddr;

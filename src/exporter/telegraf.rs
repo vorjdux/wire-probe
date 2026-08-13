@@ -95,6 +95,10 @@ fn format_line(prefix: &[u8], rtt_ms: Option<f64>, ts_ns: u64, out: &mut Vec<u8>
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "tests assert on known-shaped data; a panic here is a test failure, which is the point"
+)]
 mod tests {
     use super::*;
 

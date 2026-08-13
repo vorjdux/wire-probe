@@ -13,6 +13,17 @@ readme = "README.md"
 keywords = ["monitoring", "latency", "telemetry", "collectd", "telegraf"]
 categories = ["command-line-utilities", "network-programming"]
 
+[lints.rust]
+# unreachable_pub is deliberately NOT here: it wants pub(crate) on every item,
+# while clippy::redundant_pub_crate (nursery, enabled below) wants plain pub
+# inside private modules. In a binary crate both spellings give identical
+# reachability, so the two lints are unsatisfiable together and the clippy one
+# is kept.
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
@@ -23,6 +34,10 @@ undocumented_unsafe_blocks = "warn"
 arithmetic_side_effects = "warn"
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
+# panic = "abort" means any panic kills the agent, so indexing and modulo  -
+# the two operations here that can panic on their own  -  are opt-in per site.
+indexing_slicing = "warn"
+modulo_arithmetic = "warn"
 
 [dependencies]
 io-uring = "0.7"

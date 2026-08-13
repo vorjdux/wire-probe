@@ -45,7 +45,8 @@ impl CollectdExporter {
         self.buf.extend_from_slice(&self.prefix);
 
         let mut ryu_buf = ryu::Buffer::new();
-        self.buf.extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
+        self.buf
+            .extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
         self.buf.push(b'\n');
 
         match &mut self.dest {

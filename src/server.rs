@@ -1,4 +1,4 @@
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
@@ -54,7 +54,10 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
                             // Non-transient error (e.g. EMFILE  -  fd table exhausted).
                             // Log once and sleep so a sustained failure neither hot-spins
                             // the CPU nor floods stderr with one line per connection.
-                            eprintln!("warn: accept error: {}", std::io::Error::from_raw_os_error(errno));
+                            eprintln!(
+                                "warn: accept error: {}",
+                                std::io::Error::from_raw_os_error(errno)
+                            );
                             std::thread::sleep(ACCEPT_ERROR_BACKOFF);
                         }
                     }

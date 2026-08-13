@@ -50,13 +50,11 @@ fn main() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let interval_secs = interval.as_secs_f64().round().max(1.0) as u32;
 
-            let mut exp =
-                Exporter::new(&export, &target_name, &az, &host, interval_secs).unwrap_or_else(
-                    |e| {
-                        eprintln!("exporter init error: {e}");
-                        std::process::exit(1);
-                    },
-                );
+            let mut exp = Exporter::new(&export, &target_name, &az, &host, interval_secs)
+                .unwrap_or_else(|e| {
+                    eprintln!("exporter init error: {e}");
+                    std::process::exit(1);
+                });
 
             loop {
                 let tick = Instant::now();

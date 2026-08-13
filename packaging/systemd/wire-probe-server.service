@@ -1,0 +1,21 @@
+[Unit]
+Description=Wire Probe Server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wire-probe --mode server --port 9999
+
+Restart=always
+RestartSec=1
+# Exponential backoff 1s -> 10m over 5 steps. RestartMaxDelaySec/RestartSteps
+# require systemd >= 254; older systemd logs an "Unknown key name" warning and
+# ignores them, falling back to a flat 1s RestartSec (unit still starts).
+RestartMaxDelaySec=10m
+RestartSteps=5
+TimeoutStopSec=1
+
+[Install]
+WantedBy=multi-user.target

@@ -92,6 +92,26 @@ wire-probe --mode server [--port <port>] [--bind <addr>]
 | `--port` | `9999` | TCP port to listen on |
 | `--bind` | `0.0.0.0` | Bind address (use a private IP to restrict exposure) |
 
+#### Running under systemd
+
+A ready-made unit ships in
+[`packaging/systemd/wire-probe-server.service`](packaging/systemd/wire-probe-server.service):
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/vorjdux/wire-probe/main/packaging/systemd/wire-probe-server.service \
+  -o /etc/systemd/system/wire-probe-server.service
+
+# adjust --port / --bind if needed
+systemctl edit --full wire-probe-server.service
+
+systemctl daemon-reload
+systemctl enable --now wire-probe-server
+systemctl status wire-probe-server
+```
+
+The unit assumes the binary is at `/usr/local/bin/wire-probe` (the default
+`install.sh` location when run as root) and restarts on failure with backoff.
+
 ### Probe mode
 
 Runs on the observer host. Measures the TCP handshake RTT to the target and
@@ -170,21 +190,42 @@ Streams `PUTVAL` lines directly to collectd's
 
 ## Collectd Python plugin
 
-A drop-in replacement for collectd's `ping` plugin  -  same config syntax,
-same metric names (`ping`, `ping_droprate`, `ping_stddev`), no recompilation
-of collectd required.
+A drop-in replacement for collectd's `ping` plugin  -  same value types
+(`ping`, `ping_droprate`, `ping_stddev`), no recompilation of collectd
+required.
+
+Being a Python module, it is loaded via the `python` plugin  -  **not** with a
+bare `<Plugin wire_probe>` block (that will not load the module):
 
 ```xml
-<Plugin wire_probe>
-  Host "db-node-01"
-  Host "db-node-02"
-  Host "app-node-01"
+LoadPlugin python
 
-  Port      9999
-  Timeout   5.0
-  PingCount 1
+<Plugin python>
+  ModulePath "/usr/lib/collectd/wire_probe"
+  Import "wire_probe"
+
+  <Module wire_probe>
+    Host "db-node-01"
+    Host "db-node-02"
+    Host "app-node-01"
+
+    Port      9999
+    Timeout   5.0
+    PingCount 1
+  </Module>
 </Plugin>
 ```
+
+`LoadPlugin python` is only needed if the python plugin is not already loaded
+elsewhere in `collectd.conf`  -  drop that line if it is, to avoid a duplicate
+`LoadPlugin` warning at startup.
+
+> **Where the data lands in InfluxDB:** collectd's InfluxDB naming derives the
+> measurement from the *plugin* name, not the value type  -  so probes appear in
+> **`wire_probe_value`** (tag `type` in `ping`/`ping_droprate`/`ping_stddev`,
+> `type_instance` = target host), **not** in `ping_value`. To fold the data
+> into the existing `ping_value` measurement instead, set `v.plugin = "ping"`
+> in `wire_probe.py`  -  at the cost of mixing L4 RTT with real ICMP ping.
 
 Install:
 
@@ -198,7 +239,7 @@ Or manually:
 mkdir -p /usr/lib/collectd/wire_probe
 cp plugin/collectd/wire_probe.py /usr/lib/collectd/wire_probe/
 cp plugin/collectd/wire_probe.conf /etc/collectd/conf.d/
-systemctl reload collectd
+systemctl restart collectd   # collectd has no reload
 ```
 
 See [`plugin/collectd/wire_probe.conf`](plugin/collectd/wire_probe.conf) for

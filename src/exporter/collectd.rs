@@ -26,7 +26,13 @@ pub struct CollectdExporter {
 
 enum Dest {
     Exec,
-    Uds(UnixStream),
+    /// The path is kept so the stream can be reopened: a write that fails
+    /// part-way leaves half a PUTVAL line in the socket, and a collectd
+    /// restart leaves the stream dead for the life of the process.
+    Uds {
+        path: String,
+        stream: UnixStream,
+    },
 }
 
 impl CollectdExporter {
@@ -49,43 +55,48 @@ impl CollectdExporter {
         target_name: &str,
         interval_secs: u32,
     ) -> io::Result<Self> {
-        let stream = UnixStream::connect(path)?;
-        // A Unix stream socket is NOT fire-and-forget: if collectd stops
-        // reading, the kernel buffer fills and write_all() blocks forever,
-        // which would stop the probe measuring. Bound it so a stalled consumer
-        // costs one send, not the process.
-        stream.set_write_timeout(Some(UDS_WRITE_TIMEOUT))?;
+        let stream = connect_uds(path)?;
         let prefix = build_prefix(hostname, target_name, interval_secs);
         Ok(Self {
-            dest: Dest::Uds(stream),
+            dest: Dest::Uds {
+                path: path.to_string(),
+                stream,
+            },
             buf: Vec::with_capacity(prefix.len().saturating_add(VALUE_HEADROOM)),
             prefix,
         })
     }
 
     pub fn send(&mut self, rtt_ms: f64) -> io::Result<()> {
-        self.buf.clear();
-        self.buf.extend_from_slice(&self.prefix);
-
-        let mut ryu_buf = ryu::Buffer::new();
-        self.buf
-            .extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
-
+        self.format_line(Some(rtt_ms));
         self.flush_line()
     }
 
     /// Sends `N:U` (undefined) for a failed probe.
     pub fn send_failure(&mut self) -> io::Result<()> {
-        self.buf.clear();
-        self.buf.extend_from_slice(&self.prefix);
-        self.buf.push(b'U');
-
+        self.format_line(None);
         self.flush_line()
     }
 
-    fn flush_line(&mut self) -> io::Result<()> {
-        self.buf.push(b'\n');
+    /// Renders one PUTVAL line into `buf`: the value, or `U` when the probe
+    /// failed. Separated from the I/O so tests exercise the same formatting
+    /// the send path uses, instead of a copy of it  -  the Exec destination
+    /// writes to stdout, where a test has nothing to inspect.
+    fn format_line(&mut self, rtt_ms: Option<f64>) {
+        self.buf.clear();
+        self.buf.extend_from_slice(&self.prefix);
 
+        match rtt_ms {
+            Some(rtt) => {
+                let mut ryu_buf = ryu::Buffer::new();
+                self.buf.extend_from_slice(ryu_buf.format(rtt).as_bytes());
+            }
+            None => self.buf.push(b'U'),
+        }
+        self.buf.push(b'\n');
+    }
+
+    fn flush_line(&mut self) -> io::Result<()> {
         match &mut self.dest {
             Dest::Exec => {
                 let stdout = io::stdout();
@@ -96,9 +107,33 @@ impl CollectdExporter {
                 // rather than relying on the trailing newline.
                 lock.flush()
             }
-            Dest::Uds(stream) => stream.write_all(&self.buf),
+            Dest::Uds { path, stream } => {
+                // write_all() on a stream socket can write part of the line and
+                // then hit the write timeout, and it does not report how much
+                // got through. Half a PUTVAL line stays in the socket, and the
+                // next send appends a fresh prefix to that half, handing
+                // collectd a corrupt line. Reconnecting after any write error
+                // discards the torn frame, and also recovers the case where
+                // collectd restarted and left this stream dead forever.
+                match stream.write_all(&self.buf) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        *stream = connect_uds(path)?;
+                        Err(e)
+                    }
+                }
+            }
         }
     }
+}
+
+/// Connects to the collectd `UnixSock` plugin with a bounded write timeout: a
+/// stream socket blocks once the kernel buffer fills, which would stop the
+/// probe measuring entirely if collectd stopped reading.
+fn connect_uds(path: &str) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_write_timeout(Some(UDS_WRITE_TIMEOUT))?;
+    Ok(stream)
 }
 
 fn build_prefix(hostname: &str, target_name: &str, interval_secs: u32) -> Vec<u8> {
@@ -128,20 +163,105 @@ mod tests {
     }
 
     #[test]
-    fn exec_exporter_writes_value_then_undefined_on_failure() {
-        // Exercises the same buffer the socket path uses, without a consumer.
-        let mut e = CollectdExporter::new_exec("obs01", "t", 1);
-        e.buf.clear();
-        e.buf.extend_from_slice(&e.prefix);
-        let mut ryu_buf = ryu::Buffer::new();
-        e.buf
-            .extend_from_slice(ryu_buf.format(4.125_f64).as_bytes());
-        assert!(String::from_utf8_lossy(&e.buf).ends_with("N:4.125"));
+    fn format_line_renders_value_and_undefined_marker() {
+        // Calls the same formatting `send`/`send_failure` call, rather than
+        // reproducing it: a test that rebuilds the body only ever checks its
+        // own copy.
+        let mut e = CollectdExporter::new_exec("obs01", "mdb_primary", 10);
 
-        e.buf.clear();
-        e.buf.extend_from_slice(&e.prefix);
-        e.buf.push(b'U');
-        assert!(String::from_utf8_lossy(&e.buf).ends_with("N:U"));
+        e.format_line(Some(4.125));
+        assert_eq!(
+            String::from_utf8(e.buf.clone()).unwrap(),
+            "PUTVAL obs01/wire-probe-tcp/latency-mdb_primary interval=10 N:4.125\n"
+        );
+
+        e.format_line(None);
+        assert_eq!(
+            String::from_utf8(e.buf.clone()).unwrap(),
+            "PUTVAL obs01/wire-probe-tcp/latency-mdb_primary interval=10 N:U\n"
+        );
+    }
+
+    #[test]
+    fn uds_send_writes_the_line_a_reader_can_parse() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("wire-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("collectd.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let mut e =
+            CollectdExporter::new_uds(sock.to_str().unwrap(), "obs01", "mdb_primary", 10).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        e.send(4.125).unwrap();
+        e.send_failure().unwrap();
+
+        let mut reader = BufReader::new(server);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            "PUTVAL obs01/wire-probe-tcp/latency-mdb_primary interval=10 N:4.125\n"
+        );
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            "PUTVAL obs01/wire-probe-tcp/latency-mdb_primary interval=10 N:U\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn uds_reconnects_after_the_consumer_goes_away() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("wire-probe-reconnect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("collectd.sock");
+        let _ = std::fs::remove_file(&sock);
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut e = CollectdExporter::new_uds(sock.to_str().unwrap(), "obs01", "t", 1).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        // collectd goes away and comes back on the same path. Dropping a
+        // UnixListener does not unlink the socket file, so remove it first.
+        drop(server);
+        drop(listener);
+        std::fs::remove_file(&sock).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // The first send hits the dead peer: it reports the error and
+        // reconnects on the way out. The next one lands on the new socket,
+        // which is the behaviour that keeps a collectd restart from leaving
+        // this exporter mute for the life of the process.
+        assert!(
+            e.send(1.0).is_err(),
+            "writing to a closed peer should report an error"
+        );
+        e.send(2.0)
+            .expect("exporter should have reconnected after the failed write");
+
+        let (server, _) = listener.accept().unwrap();
+        e.send(4.125).unwrap();
+
+        // Whole lines arrive, in order: no torn frame from the failed write.
+        let mut reader = BufReader::new(server);
+        let mut first = String::new();
+        let mut second = String::new();
+        reader.read_line(&mut first).unwrap();
+        reader.read_line(&mut second).unwrap();
+        assert!(first.ends_with("N:2.0\n"), "got: {first}");
+        assert!(second.ends_with("N:4.125\n"), "got: {second}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -65,7 +65,10 @@ fn run_blocking(listener: &TcpListener) -> std::io::Result<()> {
     loop {
         match listener.accept() {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // No WouldBlock arm: this listener comes from bind() and is
+            // blocking, so accept never returns EAGAIN. An empty arm here
+            // would hot-spin without backoff if that ever stopped holding,
+            // which is the exact failure the branch below exists to prevent.
             Err(e) => {
                 // Same reasoning as the io_uring path: back off so a sustained
                 // failure (EMFILE) neither hot-spins nor floods stderr.

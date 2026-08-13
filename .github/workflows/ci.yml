@@ -33,7 +33,12 @@ jobs:
         run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Clippy
-        run: cargo clippy --target x86_64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+
+      # Runs on the host target: the musl tests would need a musl runner, and
+      # these cover parsing and wire formats, which are target-independent.
+      - name: Unit tests
+        run: cargo test
 
       - name: Confirm binary is fully static
         run: |

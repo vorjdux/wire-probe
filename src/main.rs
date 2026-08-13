@@ -85,8 +85,15 @@ fn main() {
                         // address for its whole life: a DNS-based failover, or
                         // a first answer that is an unreachable AAAA, would
                         // never be picked up. Re-resolve after a run of
-                        // failures  -  still outside the timed section, and only
-                        // when the current address is not working anyway.
+                        // failures, only when the current address is not
+                        // working anyway.
+                        //
+                        // This is outside the RTT measurement, but NOT outside
+                        // the loop: getaddrinfo is synchronous with no timeout
+                        // of its own, so a stuck resolver stretches one cycle
+                        // in five. Acceptable because by the time it fires the
+                        // target is already failing and cadence is already
+                        // bounded by --timeout, not because it is free.
                         if consecutive_failures % RERESOLVE_AFTER_FAILURES == 0 {
                             match resolve(&target) {
                                 Ok(new_addr) if new_addr != addr => {

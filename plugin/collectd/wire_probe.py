@@ -242,6 +242,13 @@ def read_cb():
             collectd.warning(f"{PLUGIN_NAME}: cannot resolve '{hostname}', counting as drop")
 
         samples = []
+        # Counted separately from ping_count: a probe that was never attempted
+        # is not a lost packet. Dividing by ping_count made the plugin's own
+        # budget look like packet loss  -  with PingCount 3 and the budget
+        # cutting the loop after two successful handshakes, droprate came out
+        # at 0.33 with nothing actually dropped, on the one metric people
+        # alert on.
+        attempts = 0
         for _ in range(ping_count):
             if addr_info is None:
                 break
@@ -249,12 +256,20 @@ def read_cb():
             if remaining <= 0:
                 collectd.warning(f"{PLUGIN_NAME}: read budget exhausted, skipping remaining probes")
                 break
+            attempts += 1
             rtt = _tcp_rtt(addr_info, min(timeout, remaining))
             if rtt is not None:
                 samples.append(rtt)
 
-        drops = ping_count - len(samples)
-        droprate = drops / ping_count
+        if addr_info is None:
+            # Resolution failure is a real drop: the target cannot be reached.
+            droprate = 1.0
+        elif attempts == 0:
+            # Budget gone before a single handshake. Nothing was measured, so
+            # claim nothing: NaN leaves a gap rather than inventing loss.
+            droprate = float("nan")
+        else:
+            droprate = (attempts - len(samples)) / attempts
 
         if samples:
             avg = sum(samples) / len(samples)

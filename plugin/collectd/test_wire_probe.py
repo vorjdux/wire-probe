@@ -231,6 +231,56 @@ class TestReadCb(unittest.TestCase):
         finally:
             srv2.close()
 
+    def test_budget_truncation_is_not_reported_as_packet_loss(self):
+        # Regression guard: dividing drops by PingCount instead of by attempts
+        # made the plugin's own budget look like loss. Two handshakes succeed,
+        # the third never runs, and droprate must stay 0.
+        real_resolve, real_rtt = wire_probe._resolve, wire_probe._tcp_rtt
+        _collectd.get_interval = lambda: 1.0  # 0.8s budget
+
+        def slow_success(_addr_info, _timeout):
+            time.sleep(0.5)
+            return 500.0
+
+        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._tcp_rtt = slow_success
+        wire_probe._hosts = [("h", "h", None)]
+        wire_probe._ping_count = 3
+        try:
+            wire_probe.read_cb()
+        finally:
+            wire_probe._resolve, wire_probe._tcp_rtt = real_resolve, real_rtt
+            _collectd.get_interval = lambda: 10.0
+            wire_probe._ping_count = 1
+
+        self.assertEqual(self.values()["ping_droprate"], 0.0)
+
+    def test_nothing_attempted_reports_no_droprate_rather_than_total_loss(self):
+        real_resolve, real_rtt = wire_probe._resolve, wire_probe._tcp_rtt
+        _collectd.get_interval = lambda: 1.0
+
+        def burn_the_budget(_addr_info, _timeout):
+            time.sleep(1.0)
+            return 1000.0
+
+        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._tcp_rtt = burn_the_budget
+        # First host eats the budget; the second never gets a handshake.
+        wire_probe._hosts = [("a", "a", None), ("b", "b", None)]
+        wire_probe._ping_count = 1
+        try:
+            wire_probe.read_cb()
+        finally:
+            wire_probe._resolve, wire_probe._tcp_rtt = real_resolve, real_rtt
+            _collectd.get_interval = lambda: 10.0
+
+        by_host = {ti: v for t, ti, v in DISPATCHED if t == "ping_droprate"}
+        self.assertEqual(by_host.get("a"), 0.0)
+        self.assertTrue(
+            "b" not in by_host or math.isnan(by_host["b"]),
+            f"unattempted host claimed loss: {by_host}",
+        )
+
     def test_host_on_the_global_port_keeps_the_bare_hostname(self):
         # Existing series must not be renamed.
         wire_probe._hosts = [("127.0.0.1", "127.0.0.1", None)]

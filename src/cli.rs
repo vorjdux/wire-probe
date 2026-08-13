@@ -34,8 +34,10 @@ const MAX_INTERVAL_MS: u64 = 86_400_000;
 /// Maximum connect timeout (60 s). Prevents probes from hanging indefinitely.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
-pub fn print_help() {
-    eprintln!(
+/// Writes usage to stdout when the user asked for it, stderr when it follows
+/// an error. `--help | less` showed nothing while this always used stderr.
+pub fn print_help(to_stdout: bool) {
+    let help = format!(
         "wire-probe {VERSION}  -  zero-footprint L4 TCP telemetry agent
 Author: Matheus Santos <vorj.dux@gmail.com>
 License: MIT  |  https://github.com/vorjdux/wire-probe
@@ -72,23 +74,28 @@ EXAMPLES:
   wire-probe --mode probe --target db-host:9999 --export telegraf-udp://127.0.0.1:8094
   wire-probe --mode probe --target db-host:9999 --interval 10s --export collectd-exec"
     );
+    if to_stdout {
+        println!("{help}");
+    } else {
+        eprintln!("{help}");
+    }
 }
 
 pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
     let mut args = Arguments::from_env();
 
     if args.contains(["-h", "--help"]) {
-        print_help();
+        print_help(true);
         std::process::exit(0);
     }
 
     if args.contains("--version") {
-        eprintln!("wire-probe {VERSION}");
+        println!("wire-probe {VERSION}");
         std::process::exit(0);
     }
 
     let mode: String = args.opt_value_from_str("--mode")?.ok_or_else(|| {
-        print_help();
+        print_help(false);
         "missing required flag --mode"
     })?;
 

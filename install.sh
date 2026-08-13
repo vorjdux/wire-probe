@@ -144,7 +144,10 @@ tar xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
 EXTRACTED=$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)
 [ -n "$EXTRACTED" ] || die "binary '${BINARY}' not found in archive"
 
-chmod +x "$EXTRACTED"
+# 755, not +x: `chmod +x` is masked by umask, so installing as root under
+# umask 077 produced a 0700 binary in /usr/local/bin that no service user  -
+# including the DynamicUser in the systemd unit  -  could execute.
+chmod 755 "$EXTRACTED"
 mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
 
 ok "installed ${INSTALL_DIR}/${BINARY}"

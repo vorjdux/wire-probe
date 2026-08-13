@@ -86,7 +86,17 @@ fn run_io_uring(listener: &TcpListener, mut ring: IoUring) -> std::io::Result<()
     ring.submit()?;
 
     loop {
-        ring.submit_and_wait(1)?;
+        // io_uring_enter returns EINTR whenever a signal is delivered while it
+        // waits, even for signals whose default action is not to terminate.
+        // SIGCONT after a cgroup freeze (Kubernetes eviction, checkpointing,
+        // `systemctl freeze`, a debugger detaching) is enough. Propagating that
+        // killed the server; the blocking fallback survived the same signal,
+        // so the two paths did not agree on what is fatal.
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
 
         let mut rearm = false;
         {

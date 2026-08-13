@@ -44,7 +44,7 @@ USAGE:
     wire-probe --mode <server|probe> [OPTIONS]
 
 MODES:
-  server    Accept/drop loop on the target host (io_uring, ~500 KB RSS)
+  server    Accept/drop loop on the target host (io_uring, ~460 KB RSS)
   probe     Measure TCP handshake RTT and export metrics
 
 SERVER OPTIONS:
@@ -133,6 +133,20 @@ pub fn parse() -> Result<Mode, Box<dyn std::error::Error>> {
             if timeout.as_millis() > u128::from(MAX_TIMEOUT_MS) {
                 return Err(format!("timeout too large (max {MAX_TIMEOUT_MS}ms = 60s)").into());
             }
+            // Not an error: a long timeout is legitimate on a high-latency link.
+            // But a probe that blocks past its own interval silently drops to a
+            // cadence of 1/timeout, so say so instead of letting it be inferred
+            // from thinning data.
+            if timeout > interval {
+                eprintln!(
+                    "warning: --timeout ({}ms) exceeds --interval ({}ms)  -  a failing target \
+                     will be probed every {}ms, not every {}ms",
+                    timeout.as_millis(),
+                    interval.as_millis(),
+                    timeout.as_millis(),
+                    interval.as_millis()
+                );
+            }
             let export = parse_export(&export_str)?;
             reject_unknown(args.finish())?;
 
@@ -182,7 +196,10 @@ fn parse_duration(s: &str) -> Result<Duration, Box<dyn std::error::Error>> {
     }
 }
 
-#[allow(clippy::option_if_let_else)]
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the if/else-if chain over strip_prefix reads better than nested map_or_else"
+)]
 fn parse_export(s: &str) -> Result<ExportDst, Box<dyn std::error::Error>> {
     if let Some(addr) = s.strip_prefix("telegraf-udp://") {
         Ok(ExportDst::TelegrafUdp(addr.to_string()))
@@ -195,5 +212,70 @@ fn parse_export(s: &str) -> Result<ExportDst, Box<dyn std::error::Error>> {
             "unknown export scheme '{s}'; expected telegraf-udp://<addr>, collectd-uds://<path>, or collectd-exec"
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_safe_chars_and_replaces_the_rest() {
+        assert_eq!(sanitize("db-node-01.eu"), "db-node-01.eu");
+        // Characters that would break ILP tag values or PUTVAL identifiers.
+        assert_eq!(sanitize("a b/c,d=e:f"), "a_b_c_d_e_f");
+        // ASCII-only: multi-byte UTF-8 must not survive as raw bytes.
+        assert_eq!(sanitize("café"), "caf_");
+        assert_eq!(sanitize(""), "");
+    }
+
+    #[test]
+    fn parse_duration_ms_suffix_wins_over_s() {
+        // Regression guard: strip_suffix("ms") MUST be tried before
+        // strip_suffix('s'). Reversed, "500ms" parses as "500m" seconds and
+        // the whole probe cadence silently changes by 1000x.
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        // Bare number means milliseconds.
+        assert_eq!(parse_duration("250").unwrap(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage() {
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("10x").is_err());
+        assert!(parse_duration("-5s").is_err());
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn parse_export_recognises_every_scheme() {
+        assert!(matches!(
+            parse_export("collectd-exec").unwrap(),
+            ExportDst::CollectdExec
+        ));
+        match parse_export("telegraf-udp://127.0.0.1:8094").unwrap() {
+            ExportDst::TelegrafUdp(a) => assert_eq!(a, "127.0.0.1:8094"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match parse_export("collectd-uds:///var/run/collectd-unixsock").unwrap() {
+            ExportDst::CollectdUds(p) => assert_eq!(p, "/var/run/collectd-unixsock"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_export_rejects_unknown_scheme() {
+        assert!(parse_export("kafka://localhost:9092").is_err());
+        assert!(parse_export("").is_err());
+        // Near-misses on the known schemes must not fall through.
+        assert!(parse_export("collectd-exe").is_err());
+        assert!(parse_export("telegraf-udp:/127.0.0.1:8094").is_err());
+    }
+
+    #[test]
+    fn reject_unknown_flags_a_leftover_argument() {
+        assert!(reject_unknown(vec![]).is_ok());
+        assert!(reject_unknown(vec![OsString::from("--typoed")]).is_err());
     }
 }

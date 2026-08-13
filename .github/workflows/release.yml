@@ -20,8 +20,33 @@ env:
 # Static musl builds  -  tarball works on ANY Linux distro, any glibc version
 # ──────────────────────────────────────────────────────────────────────────────
 jobs:
+  # Artifact names come from the tag, but --version comes from CARGO_PKG_VERSION.
+  # Without this gate, tagging v0.1.6 on a manifest still reading 0.1.5 ships
+  # wire-probe-0.1.6-*.tar.gz containing a binary that reports 0.1.5.
+  # Runs unconditionally rather than under `if: startsWith(github.ref, ...)`:
+  # a skipped job would skip everything that needs it, breaking workflow_dispatch.
+  check-version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag with manifest version
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) echo "not a tag ref  -  nothing to compare"; exit 0 ;;
+          esac
+          TAG="${GITHUB_REF_NAME#v}"
+          MANIFEST=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "tag=${TAG}  manifest=${MANIFEST}"
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "::error::tag v${TAG} does not match Cargo.toml version ${MANIFEST}"
+            exit 1
+          fi
+
   build-static:
     name: Static · ${{ matrix.arch }}
+    needs: check-version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -70,6 +95,7 @@ jobs:
   # Native glibc builds  -  distro-specific tarballs
   # ──────────────────────────────────────────────────────────────────────────
   build-distro:
+    needs: check-version
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}

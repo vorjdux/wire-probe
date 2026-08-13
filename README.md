@@ -13,12 +13,16 @@ ICMP ping is blocked by most firewalls and tells you nothing about the TCP stack
 latency a real client sees  -  with no kernel module, no eBPF, no agent framework.
 
 - **Server mode**  -  `io_uring` accept/drop loop; accepts SYNs and immediately
-  closes them, consuming ~500 KB RSS at any connection rate
+  closes them. RSS stays ~460 KB regardless of connection rate because nothing
+  is allocated per connection  -  but throughput is bounded by one accept in
+  flight, so a rate high enough to fill the listen backlog delays handshakes
+  rather than growing memory. Falls back to blocking `accept()` where
+  `io_uring` is unavailable
 - **Probe mode**  -  blocking `TcpStream::connect_timeout` wrapped with
   `std::time::Instant`; the `--timeout` flag is the only timing bound
 - **Fire-and-forget export**  -  UDP (Telegraf Influx Line Protocol) or Unix
   domain socket / stdout (Collectd PUTVAL); no buffering, no retries
-- **Single static binary**  -  musl-linked, 370 KB stripped, zero glibc version
+- **Single static binary**  -  musl-linked, ~490 KB stripped, zero glibc version
   dependency, works on Ubuntu, Fedora, Debian, RHEL, Alpine and any other Linux
 
 ## Install
@@ -112,6 +116,13 @@ systemctl status wire-probe-server
 The unit assumes the binary is at `/usr/local/bin/wire-probe` (the default
 `install.sh` location when run as root) and restarts on failure with backoff.
 
+It runs under `DynamicUser=yes` with a locked-down sandbox: no capabilities, a
+read-only filesystem, `AF_INET`/`AF_INET6` only, and `SystemCallFilter=@system-service`
+(which nests `@aio`, where the `io_uring` syscalls live). `systemd-analyze
+security` rates it 1.3 OK, against 9.4 UNSAFE for the same unit unhardened.
+Binding a port below 1024 needs `CAP_NET_BIND_SERVICE` added back  -  see the
+commented lines in the unit.
+
 ### Probe mode
 
 Runs on the observer host. Measures the TCP handshake RTT to the target and
@@ -142,8 +153,19 @@ wire-probe --mode probe --target <host:port> [options]
 Sends one UDP datagram per probe in [Influx Line Protocol](https://docs.influxdata.com/influxdb/cloud/reference/syntax/line-protocol/) format:
 
 ```
-tcp_latency,target=mdb_primary,az=eu-west rtt_ms=4.12 1686561230000000000
+tcp_latency,target=mdb_primary,az=eu-west rtt_ms=4.12,success=1i 1686561230000000000
 ```
+
+A failed probe still emits a point, carrying `success=0i` and no `rtt_ms`:
+
+```
+tcp_latency,target=mdb_primary,az=eu-west success=0i 1686561231000000000
+```
+
+This is deliberate. Over fire-and-forget UDP a missing point is
+indistinguishable from a lost datagram, so alerting on absence cannot separate
+"target down" from "probe down". Alert on `success` instead, and note that
+`rtt_ms` is absent rather than zero on failure, so averages stay clean.
 
 Telegraf configuration:
 
@@ -166,6 +188,12 @@ Writes `PUTVAL` lines to stdout. Use with collectd's
 
 ```
 PUTVAL hostname/wire-probe-tcp/latency-mdb_primary interval=10 N:4.12
+```
+
+A failed probe sends `N:U`, collectd's "undefined" marker, rather than nothing:
+
+```
+PUTVAL hostname/wire-probe-tcp/latency-mdb_primary interval=10 N:U
 ```
 
 ```xml
@@ -247,7 +275,8 @@ the full configuration reference.
 
 ## Build from source
 
-Requires Rust 1.70+ and Linux kernel ≥ 5.1 (for `io_uring`).
+Requires Rust 1.85+ (the crate is on `edition = "2024"`) and Linux kernel
+>= 5.1 (for `io_uring`).
 
 ```bash
 git clone https://github.com/vorjdux/wire-probe
@@ -267,10 +296,10 @@ cargo build --release --target x86_64-unknown-linux-musl
 | Concern | Decision |
 |---|---|
 | Async runtime | None  -  `io_uring` for the server accept loop, blocking threads for probes |
-| Memory baseline | ~500 KB RSS (server), ~300 KB RSS (probe) |
+| Memory baseline | ~460 KB RSS (server), ~440 KB RSS (probe), measured on x86_64/musl |
 | Export allocations | Zero  -  `ryu`/`itoa` format into pre-allocated stack buffers |
 | Export reliability | Fire-and-forget; no retry, no queue  -  if Telegraf/Collectd is down, the probe skips |
-| Binary size | 370 KB stripped (fat LTO, `panic = "abort"`, `strip = true`) |
+| Binary size | ~490 KB musl static, ~380 KB glibc (fat LTO, `panic = "abort"`, `strip = true`) |
 
 ## Behind the Design
 
@@ -280,19 +309,34 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 Including a standard async runtime (like `tokio`) imposes an unacceptable baseline memory footprint (2–5 MB RSS) and scheduler overhead for a binary whose sole purpose is handling socket file descriptors.
 
-- **Server mode (`io_uring`):** The TCP accept loop is submitted to the Linux kernel's asynchronous submission/completion queues via `io_uring`. The daemon maintains an RSS under ~500 KB regardless of load because there are no per-connection allocations  -  accepted fds are closed immediately with a plain `libc::close`. Note: the current implementation uses a single outstanding accept (serial re-arm per connection); throughput is bounded by one `submit_and_wait` syscall per connection, which is sufficient for telemetry use but not for high-PPS scenarios.
+- **Server mode (`io_uring`):** The TCP accept loop is submitted to the Linux kernel's asynchronous submission/completion queues via `io_uring`. The daemon maintains an RSS around ~460 KB regardless of load because there are no per-connection allocations  -  accepted fds are closed immediately with a plain `libc::close`. Note: the current implementation uses a single outstanding accept (serial re-arm per connection); throughput is bounded by one `submit_and_wait` syscall per connection, which is sufficient for telemetry use but not for high-PPS scenarios.
 - **Probe mode (native blocking):** Uses `TcpStream::connect_timeout` on a blocking thread. The `--timeout` flag is the only timing bound  -  it maps directly to the OS-level connect timeout. The RTT is captured by `Instant::now()` around the connect call; no other mechanism is involved. DNS is resolved once at startup to avoid per-tick `getaddrinfo` blocking inside the measurement loop.
 
 ### 2. Zero-Allocation Export Path and Binary Density
 
 To guarantee the export hot path runs within the CPU's L1/L2 caches and avoids memory fragmentation during long-running execution, the binary is extremely dense.
 
-- Compiled statically via `musl-libc` with fat LTO and `panic = "abort"`, producing a ~370 KB stripped binary (~500 KB RSS at runtime for the server, ~300 KB for the probe).
-- Heap allocations are eliminated on the **export** hot path: the metric prefix is built once at construction, the send buffer is reused via `clear()`, and `ryu`/`itoa` write directly into stack-allocated buffers with no `format!` or `String` intermediary.
+- Compiled statically via `musl-libc` with fat LTO and `panic = "abort"`. Measured on x86_64 with rustc 1.96: the static musl binary is ~490 KB stripped (the glibc build is ~380 KB), with ~460 KB RSS for the server and ~440 KB for the probe.
+- Heap allocations are eliminated on the **export** hot path: the metric prefix is built once at construction, the send buffer is reused via `clear()`, and `ryu`/`itoa` write directly into stack-allocated buffers with no `format!` or `String` intermediary. The buffer is sized from the prefix length plus fixed headroom for the value and timestamp, so long hostnames or tags do not force a reallocation on the first send.
 
 ### 3. Fire-and-Forget Export and Backpressure Offloading
 
-An observability probe must never crash or block because the downstream telemetry pipeline degraded.
+An observability probe must not block, and must not be brought down, because the
+downstream telemetry pipeline degraded. How completely that holds depends on the
+exporter, and only the UDP path is fire-and-forget in the strict sense:
+
+| Export path | Can a stalled consumer block the probe? |
+|---|---|
+| `telegraf-udp://` | No. `send()` on a UDP socket never blocks on the receiver; the kernel tail-drops. If Telegraf is not listening, the ICMP port-unreachable surfaces as `ECONNREFUSED` on the *next* send, which is logged and skipped. |
+| `collectd-uds://` | Bounded. A stream socket blocks once the kernel buffer fills, so the write timeout is capped at 1s; the send then fails and the probe continues. |
+| `collectd-exec` | Yes, in principle. stdout is a pipe owned by collectd; if collectd stops reading and the pipe fills, the write blocks. Not capped, because a timeout cannot be set on a pipe the way it can on a socket. |
+
+`collectd-uds://` also requires collectd to be listening at startup: the connect
+is made once, and the probe exits if it fails.
+
+Note also that the release profile sets `panic = "abort"`, so a panic terminates
+the process rather than unwinding  -  the guarantee is about backpressure, not that
+the process is panic-proof. Restart supervision is the systemd unit's job.
 
 - By forcing metric injection via UDP datagrams (Telegraf/Influx) or Unix domain sockets (Collectd), `wire-probe` structurally outsources backpressure handling to the Linux kernel.
 - If the destination TSDB stalls or the Telegraf process hangs, the kernel applies a silent tail-drop at the receive buffer. This isolates the probe, shielding it from file descriptor exhaustion or OOM kills.

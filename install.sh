@@ -8,6 +8,7 @@
 #   VERSION=0.1.0   install a specific version (without the 'v' prefix)
 #   INSTALL_DIR=/usr/local/bin   override install location
 #   NO_COLOR=1      disable coloured output
+#   INSECURE=1      skip SHA256 checksum verification (not recommended)
 set -e
 
 REPO="vorjdux/wire-probe"
@@ -38,6 +39,7 @@ for arg in "$@"; do
       echo ""
       echo "Environment variables:"
       echo "  VERSION=0.1.0       install a specific version"
+      echo "  INSECURE=1          skip checksum verification"
       echo "  INSTALL_DIR=/path   override install directory"
       exit 0 ;;
   esac
@@ -53,7 +55,8 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   SHA256_CMD="shasum -a 256"
 else
-  warn "sha256sum/shasum not found  -  skipping checksum verification"
+  # Not fatal here: the verification block below decides, so that INSECURE=1
+  # still works on a host without either tool.
   SHA256_CMD=""
 fi
 
@@ -85,9 +88,11 @@ if [ -z "${INSTALL_DIR:-}" ]; then
     INSTALL_DIR="/usr/local/bin"
   else
     INSTALL_DIR="$HOME/.local/bin"
-    mkdir -p "$INSTALL_DIR"
   fi
 fi
+# Applies to a caller-supplied INSTALL_DIR too: without this, a directory that
+# does not exist yet surfaces as a cryptic mv failure after the download.
+mkdir -p "$INSTALL_DIR" || die "cannot create install directory ${INSTALL_DIR}"
 
 ARCHIVE_NAME="${BINARY}-${VERSION}-${OS}-${ARCH}.tar.gz"
 BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
@@ -111,24 +116,27 @@ curl --proto '=https' --tlsv1.2 -sfL "$ARCHIVE_URL" -o "$ARCHIVE_PATH" \
   || die "download failed: ${ARCHIVE_URL}"
 
 # ── Checksum verification ──────────────────────────────────────────────────
-if [ -n "$SHA256_CMD" ]; then
+# Fail closed. Every release publishes SHA256SUMS, so a missing or incomplete
+# one means something is wrong with the download path, and this script pipes
+# a downloaded binary straight into a system directory. INSECURE=1 opts out.
+if [ -n "${INSECURE:-}" ]; then
+  warn "INSECURE=1  -  skipping checksum verification"
+elif [ -z "$SHA256_CMD" ]; then
+  die "no sha256 tool found (sha256sum or shasum)  -  install one, or re-run with INSECURE=1"
+else
   SUMS_PATH="${TMP_DIR}/SHA256SUMS"
-  curl --proto '=https' --tlsv1.2 -sfL "$SUMS_URL" -o "$SUMS_PATH" 2>/dev/null || true
+  curl --proto '=https' --tlsv1.2 -sfL "$SUMS_URL" -o "$SUMS_PATH" 2>/dev/null \
+    || die "cannot download SHA256SUMS from ${SUMS_URL}  -  re-run with INSECURE=1 to skip"
 
-  if [ -f "$SUMS_PATH" ]; then
-    EXPECTED=$(grep "${ARCHIVE_NAME}" "$SUMS_PATH" | cut -d' ' -f1)
-    if [ -n "$EXPECTED" ]; then
-      ACTUAL=$($SHA256_CMD "$ARCHIVE_PATH" | cut -d' ' -f1)
-      [ "$ACTUAL" = "$EXPECTED" ] || die "checksum mismatch for ${ARCHIVE_NAME}
+  EXPECTED=$(grep "${ARCHIVE_NAME}" "$SUMS_PATH" | cut -d' ' -f1)
+  [ -n "$EXPECTED" ] \
+    || die "${ARCHIVE_NAME} is not listed in SHA256SUMS  -  re-run with INSECURE=1 to skip"
+
+  ACTUAL=$($SHA256_CMD "$ARCHIVE_PATH" | cut -d' ' -f1)
+  [ "$ACTUAL" = "$EXPECTED" ] || die "checksum mismatch for ${ARCHIVE_NAME}
   expected: ${EXPECTED}
   actual:   ${ACTUAL}"
-      ok "checksum verified"
-    else
-      warn "archive not found in SHA256SUMS  -  skipping"
-    fi
-  else
-    warn "SHA256SUMS not available  -  skipping checksum"
-  fi
+  ok "checksum verified"
 fi
 
 # ── Extract and install ────────────────────────────────────────────────────

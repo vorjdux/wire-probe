@@ -38,7 +38,7 @@ impl CollectdExporter {
             // path" property holds for long hostnames too, instead of relying
             // on a fixed 128 bytes that a long host/target pair would outgrow
             // on the first send.
-            buf: Vec::with_capacity(prefix.len() + VALUE_HEADROOM),
+            buf: Vec::with_capacity(prefix.len().saturating_add(VALUE_HEADROOM)),
             prefix,
         }
     }
@@ -58,7 +58,7 @@ impl CollectdExporter {
         let prefix = build_prefix(hostname, target_name, interval_secs);
         Ok(Self {
             dest: Dest::Uds(stream),
-            buf: Vec::with_capacity(prefix.len() + VALUE_HEADROOM),
+            buf: Vec::with_capacity(prefix.len().saturating_add(VALUE_HEADROOM)),
             prefix,
         })
     }

@@ -196,7 +196,10 @@ fn parse_duration(s: &str) -> Result<Duration, Box<dyn std::error::Error>> {
     }
 }
 
-#[allow(clippy::option_if_let_else)]
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the if/else-if chain over strip_prefix reads better than nested map_or_else"
+)]
 fn parse_export(s: &str) -> Result<ExportDst, Box<dyn std::error::Error>> {
     if let Some(addr) = s.strip_prefix("telegraf-udp://") {
         Ok(ExportDst::TelegrafUdp(addr.to_string()))

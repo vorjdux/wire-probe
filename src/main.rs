@@ -41,7 +41,11 @@ fn main() {
             let host = hostname();
             // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
             // CLI rejects values > 86400s and max(1.0) guarantees positive; casts are safe.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "CLI caps interval at 86400s and max(1.0) keeps it positive"
+            )]
             let interval_secs = interval.as_secs_f64().round().max(1.0) as u32;
 
             let mut exp = Exporter::new(&export, &target_name, &az, &host, interval_secs)
@@ -58,7 +62,10 @@ fn main() {
                 let tick = Instant::now();
 
                 // u64 nanoseconds wraps in year ~2554; safe for practical use.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "u64 nanoseconds since the epoch wraps in year ~2554"
+                )]
                 let ts_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or(Duration::ZERO)
@@ -71,7 +78,9 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("probe error: {e}");
-                        consecutive_failures += 1;
+                        // Saturating: after ~4e9 consecutive failures a
+                        // wrapping counter would reset the re-resolve cadence.
+                        consecutive_failures = consecutive_failures.saturating_add(1);
                         // Resolving once at startup pins the process to one
                         // address for its whole life: a DNS-based failover, or
                         // a first answer that is an unreachable AAAA, would
@@ -137,6 +146,8 @@ fn hostname() -> String {
     // gethostname(3) truncates to `size` bytes  -  with a zeroed buffer of 256
     // the result is always null-terminated even if the name is exactly 255 chars.
     let mut buf = [0u8; 256];
+    // SAFETY: buf is a live, writable 256-byte array and the length passed is
+    // its true length, so gethostname cannot write out of bounds.
     unsafe {
         libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len());
     }

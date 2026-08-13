@@ -31,6 +31,7 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
         Err(e) => return Err(e),
     };
 
+    // SAFETY: getpid() takes no arguments, touches no memory, and cannot fail.
     let pid = unsafe { libc::getpid() };
     let mode = if ring.is_some() {
         "io_uring accept/drop loop"
@@ -51,13 +52,13 @@ pub fn run(bind_addr: &str, port: u16) -> std::io::Result<()> {
         );
     }
 
-    match ring {
-        Some(ring) => run_io_uring(&listener, ring),
-        None => run_blocking(&listener),
-    }
+    ring.map_or_else(
+        || run_blocking(&listener),
+        |ring| run_io_uring(&listener, ring),
+    )
 }
 
-/// Blocking fallback. `TcpListener::accept` uses accept4(SOCK_CLOEXEC) on
+/// Blocking fallback. `TcpListener::accept` uses `accept4(SOCK_CLOEXEC)` on
 /// Linux, so accepted fds do not leak into children here either. The stream is
 /// dropped immediately, which closes it.
 fn run_blocking(listener: &TcpListener) -> std::io::Result<()> {
@@ -91,13 +92,19 @@ fn run_io_uring(listener: &TcpListener, mut ring: IoUring) -> std::io::Result<()
                 if cqe.user_data() == ACCEPT_TOKEN {
                     let fd = cqe.result();
                     if fd >= 0 {
+                        // SAFETY: fd is a descriptor the kernel just handed
+                        // back from this accept completion, owned by nothing
+                        // else and closed exactly once here.
                         if unsafe { libc::close(fd) } != 0 {
                             let err = std::io::Error::last_os_error();
                             eprintln!("warn: close(fd={fd}) failed: {err}");
                         }
                     } else {
                         // Negative result means the accept syscall failed.
-                        let errno = -fd;
+                        // saturating_neg: i32::MIN has no positive counterpart.
+                        // The kernel never returns it here, but negating it
+                        // would overflow.
+                        let errno = fd.saturating_neg();
                         if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
                             // Non-transient error (e.g. EMFILE  -  fd table exhausted).
                             // Log once and sleep so a sustained failure neither hot-spins
@@ -130,6 +137,9 @@ fn push_accept(ring: &mut IoUring, fd: i32) -> std::io::Result<()> {
         .build()
         .user_data(ACCEPT_TOKEN);
 
+    // SAFETY: the SQE is fully initialised by the builder above, and the
+    // pointers it carries are null (no client address is requested), so
+    // nothing must outlive this call for the kernel to read.
     unsafe {
         ring.submission()
             .push(&sqe)

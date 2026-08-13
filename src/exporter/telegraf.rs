@@ -41,7 +41,7 @@ impl TelegrafExporter {
             // Sized from the actual prefix: a fixed 128 bytes would reallocate
             // on the first send once tags are long, undercutting the
             // no-allocation-on-the-hot-path property.
-            buf: Vec::with_capacity(prefix.len() + VALUE_HEADROOM),
+            buf: Vec::with_capacity(prefix.len().saturating_add(VALUE_HEADROOM)),
             socket,
             prefix,
         })

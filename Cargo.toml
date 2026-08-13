@@ -5,6 +5,24 @@ edition = "2024"
 # Edition 2024 requires 1.85; without this Cargo fails with an opaque
 # "feature `edition2024` is required" instead of naming the toolchain.
 rust-version = "1.85"
+description = "Zero-footprint L4 telemetry agent: TCP handshake RTT, sub-1 MB RAM, no runtime deps"
+license = "MIT"
+repository = "https://github.com/vorjdux/wire-probe"
+homepage = "https://github.com/vorjdux/wire-probe"
+readme = "README.md"
+keywords = ["monitoring", "latency", "telemetry", "collectd", "telegraf"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Picked out of `restriction`, which is deliberately contradictory as a whole
+# (it wants explicit `return`, bans `?`, and prefers `core` over `std`).
+undocumented_unsafe_blocks = "warn"
+arithmetic_side_effects = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 
 [dependencies]
 io-uring = "0.7"

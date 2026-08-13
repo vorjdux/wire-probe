@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 /// Timing is entirely `connect_timeout` + `Instant`; the `--timeout` flag
 /// is the only bound on how long this call can block. The socket is dropped
 /// immediately after the handshake  -  no data is ever sent or received.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "f64 is exact for nanosecond counts below 2^53, i.e. any RTT under 104 days"
+)]
 pub fn measure_rtt(addr: &SocketAddr, timeout: Duration) -> std::io::Result<f64> {
     let t0 = Instant::now();
     let _stream = TcpStream::connect_timeout(addr, timeout)?;

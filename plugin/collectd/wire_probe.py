@@ -207,8 +207,16 @@ def read_cb():
     ping_count = _ping_count
     default_port = _default_port
 
-    # Hard deadline: stop probing when the global budget is exhausted so this
-    # callback never blocks collectd's read thread for most of its Interval.
+    # Budget: stop starting work once it is exhausted, so this callback does
+    # not occupy collectd's read thread for most of its Interval.
+    #
+    # NOT a hard bound. It is checked between operations, and the operations
+    # themselves can overrun it: socket.getaddrinfo() takes no timeout
+    # argument, so a resolver that hangs for 30s blows an 8s budget no matter
+    # what is checked around it. Bounding that would mean resolving in
+    # init_cb, caching with a TTL, or running resolution on a thread with a
+    # join timeout  -  all of which trade freshness or simplicity for a
+    # guarantee this plugin does not currently need.
     deadline = time.monotonic() + _read_budget()
 
     for _display, hostname, host_port in _hosts:

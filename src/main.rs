@@ -29,123 +29,225 @@ fn main() {
             interval,
             timeout,
             export,
-        } => {
-            // Resolve outside the timed section: a per-tick getaddrinfo is a
-            // blocking syscall that would corrupt cadence on a slow resolver,
-            // and folding it into the measurement reports DNS as RTT.
-            let mut addr = resolve(&target).unwrap_or_else(|e| {
-                eprintln!("error: cannot resolve '{target}': {e}");
-                std::process::exit(1);
-            });
+        } => run_probe(&target, &target_name, &az, interval, timeout, &export),
+    }
+}
 
-            let host = hostname();
-            // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
-            // CLI rejects values > 86400s and max(1.0) guarantees positive; casts are safe.
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "CLI caps interval at 86400s and max(1.0) keeps it positive"
-            )]
-            let interval_secs = interval.as_secs_f64().round().max(1.0) as u32;
+/// The probe loop, split out of `main` so the mode dispatch stays readable.
+fn run_probe(
+    target: &str,
+    target_name: &str,
+    az: &str,
+    interval: Duration,
+    timeout: Duration,
+    export: &cli::ExportDst,
+) {
+    // Resolve outside the timed section: a per-tick getaddrinfo is a blocking
+    // syscall that would corrupt cadence on a slow resolver, and folding it
+    // into the measurement reports DNS as RTT.
+    let mut addrs = resolve(target).unwrap_or_else(|e| {
+        eprintln!("error: cannot resolve '{target}': {e}");
+        std::process::exit(1);
+    });
+    // Index into `addrs`. Exactly one address is probed per cycle, so the
+    // reported RTT keeps meaning "handshake with this endpoint"; rotating only
+    // on failure is what makes an unreachable first answer (commonly an AAAA
+    // ahead of a working A) recoverable.
+    let mut addr_idx: usize = 0;
 
-            let mut exp = Exporter::new(&export, &target_name, &az, &host, interval_secs)
-                .unwrap_or_else(|e| {
-                    eprintln!("exporter init error: {e}");
-                    std::process::exit(1);
-                });
+    let host = hostname();
+    // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
+    // CLI rejects values > 86400s and max(1.0) guarantees positive; casts are safe.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "CLI caps interval at 86400s and max(1.0) keeps it positive"
+    )]
+    let interval_secs = interval.as_secs_f64().round().max(1.0) as u32;
 
-            // Latched so a flapping target does not repeat the warning forever.
-            let mut overran = false;
-            let mut consecutive_failures: u32 = 0;
+    // PUTVAL carries integer seconds, so a sub-second interval tells collectd
+    // something the probe is not doing: ten points a second announced as one
+    // per second. Legitimate for the UDS path feeding a backend that ignores
+    // interval=, wrong for RRD, so warn instead of rejecting.
+    if matches!(
+        export,
+        cli::ExportDst::CollectdExec | cli::ExportDst::CollectdUds(_)
+    ) && interval < Duration::from_secs(1)
+    {
+        eprintln!(
+            "warning: --interval {}ms is below 1s, but PUTVAL announces interval={}  -  \
+             collectd will be told a rate the probe does not keep",
+            interval.as_millis(),
+            interval_secs
+        );
+    }
 
-            loop {
-                let tick = Instant::now();
+    let mut exp =
+        Exporter::new(export, target_name, az, &host, interval_secs).unwrap_or_else(|e| {
+            eprintln!("exporter init error: {e}");
+            std::process::exit(1);
+        });
 
-                // u64 nanoseconds wraps in year ~2554; safe for practical use.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "u64 nanoseconds since the epoch wraps in year ~2554"
-                )]
-                let ts_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO)
-                    .as_nanos() as u64;
+    // Latched so a flapping target does not repeat the warning forever.
+    let mut overran = false;
+    let mut consecutive_failures: u32 = 0;
 
-                let sent = match probe::measure_rtt(&addr, timeout) {
-                    Ok(rtt_ms) => {
-                        consecutive_failures = 0;
-                        exp.send(rtt_ms, ts_ns)
-                    }
-                    Err(e) => {
-                        eprintln!("probe error: {e}");
-                        // Saturating: after ~4e9 consecutive failures a
-                        // wrapping counter would reset the re-resolve cadence.
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        // Resolving once at startup pins the process to one
-                        // address for its whole life: a DNS-based failover, or
-                        // a first answer that is an unreachable AAAA, would
-                        // never be picked up. Re-resolve after a run of
-                        // failures, only when the current address is not
-                        // working anyway.
-                        //
-                        // This is outside the RTT measurement, but NOT outside
-                        // the loop: getaddrinfo is synchronous with no timeout
-                        // of its own, so a stuck resolver stretches one cycle
-                        // in five. Acceptable because by the time it fires the
-                        // target is already failing and cadence is already
-                        // bounded by --timeout, not because it is free.
-                        if consecutive_failures % RERESOLVE_AFTER_FAILURES == 0 {
-                            match resolve(&target) {
-                                Ok(new_addr) if new_addr != addr => {
-                                    eprintln!("info: '{target}' now resolves to {new_addr}");
-                                    addr = new_addr;
-                                }
-                                Ok(_) => {}
-                                Err(e) => eprintln!("warning: re-resolving '{target}' failed: {e}"),
-                            }
-                        }
-                        exp.send_failure(ts_ns)
-                    }
-                };
-                if let Err(e) = sent {
-                    eprintln!("export error: {e}");
+    loop {
+        let tick = Instant::now();
+
+        // u64 nanoseconds wraps in year ~2554; safe for practical use.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "u64 nanoseconds since the epoch wraps in year ~2554"
+        )]
+        let ts_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos() as u64;
+
+        let addr = addrs[addr_idx];
+        let sent = match probe::measure_rtt(&addr, timeout) {
+            Ok(rtt_ms) => {
+                consecutive_failures = 0;
+                exp.send(rtt_ms, ts_ns)
+            }
+            Err(e) => {
+                eprintln!("probe error: {e}");
+                // Saturating: after ~4e9 consecutive failures a wrapping
+                // counter would reset the re-resolve cadence.
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures % RERESOLVE_AFTER_FAILURES == 0 {
+                    rotate_target(target, &mut addrs, &mut addr_idx);
                 }
+                exp.send_failure(ts_ns)
+            }
+        };
+        if let Err(e) = sent {
+            // Under the Exec plugin, stdout IS the lifeline: collectd owns the
+            // pipe and reads it. Once it is closed, collectd has gone, and
+            // nothing this process writes will ever be read again. Exiting lets
+            // collectd start a fresh child; looping on would leave an orphan
+            // opening TCP connections to the target and reporting to no one.
+            // The UDS path reconnects instead, so it is deliberately excluded.
+            if e.kind() == std::io::ErrorKind::BrokenPipe
+                && matches!(export, cli::ExportDst::CollectdExec)
+            {
+                eprintln!("stdout closed  -  collectd is gone, exiting");
+                return;
+            }
+            eprintln!("export error: {e}");
+        }
 
-                let elapsed = tick.elapsed();
-                match interval.checked_sub(elapsed) {
-                    Some(remaining) => std::thread::sleep(remaining),
-                    None => {
-                        // A cycle that outran the interval sets the cadence to
-                        // `elapsed` instead: a blocking connect cannot be cut
-                        // short, so the effective rate DROPS to 1/timeout. Warn
-                        // once so the gap between configured and actual
-                        // interval is visible in the log.
-                        if !overran {
-                            overran = true;
-                            eprintln!(
-                                "warning: probe cycle took {}ms, longer than the {}ms interval  -  \
-                                 cadence is now bounded by --timeout, not --interval",
-                                elapsed.as_millis(),
-                                interval.as_millis()
-                            );
-                        }
-                    }
+        let elapsed = tick.elapsed();
+        match interval.checked_sub(elapsed) {
+            Some(remaining) => std::thread::sleep(remaining),
+            None => {
+                // A cycle that outran the interval sets the cadence to
+                // `elapsed` instead: a blocking connect cannot be cut short, so
+                // the effective rate DROPS to 1/timeout. Warn once so the gap
+                // between configured and actual interval is visible in the log.
+                if !overran {
+                    overran = true;
+                    eprintln!(
+                        "warning: probe cycle took {}ms, longer than the {}ms interval  -  \
+                         cadence is now bounded by --timeout, not --interval",
+                        elapsed.as_millis(),
+                        interval.as_millis()
+                    );
                 }
             }
         }
     }
 }
 
+/// Refreshes the address list and, when it is unchanged, advances to the next
+/// entry.
+///
+/// Resolving once at startup pins the process to one address for its whole
+/// life: a DNS-based failover, or an unreachable AAAA in front of a working A,
+/// would never be picked up. Both recover here.
+///
+/// This runs outside the RTT measurement, but NOT outside the loop:
+/// getaddrinfo is synchronous with no timeout of its own, so a stuck resolver
+/// stretches one cycle in five. Acceptable because by the time it fires the
+/// target is already failing and cadence is already bounded by --timeout, not
+/// because it is free.
+fn rotate_target(target: &str, addrs: &mut Vec<std::net::SocketAddr>, addr_idx: &mut usize) {
+    match resolve(target) {
+        Ok(fresh) => match apply_resolution(addrs, addr_idx, fresh) {
+            Rotation::Unchanged => {}
+            Rotation::NextAddress => eprintln!(
+                "info: trying the next address for '{target}': {}",
+                addrs[*addr_idx]
+            ),
+            Rotation::Replaced => {
+                eprintln!("info: '{target}' now resolves to {}", join_addrs(addrs));
+            }
+        },
+        Err(e) => eprintln!("warning: re-resolving '{target}' failed: {e}"),
+    }
+}
+
 /// Consecutive probe failures before the target is resolved again.
 const RERESOLVE_AFTER_FAILURES: u32 = 5;
 
-fn resolve(target: &str) -> std::io::Result<std::net::SocketAddr> {
-    target.to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(
+/// What a re-resolution did, so the caller can log it and tests can assert it
+/// without needing DNS.
+#[derive(Debug, PartialEq, Eq)]
+enum Rotation {
+    /// One address, unchanged: nothing to move to.
+    Unchanged,
+    /// Same answers, so advance to the next entry in the list.
+    NextAddress,
+    /// The answers changed; the list was replaced and the index reset.
+    Replaced,
+}
+
+/// Decides what to do with a fresh resolution. Pure, so the rotation policy is
+/// testable without a resolver: DNS is the one part of this that cannot be
+/// arranged from a test.
+fn apply_resolution(
+    addrs: &mut Vec<std::net::SocketAddr>,
+    addr_idx: &mut usize,
+    fresh: Vec<std::net::SocketAddr>,
+) -> Rotation {
+    if fresh != *addrs {
+        *addrs = fresh;
+        *addr_idx = 0;
+        return Rotation::Replaced;
+    }
+    if addrs.len() <= 1 {
+        return Rotation::Unchanged;
+    }
+    // Wrap without `%`: the modulo would be a division clippy cannot prove is
+    // non-zero, and this reads the same.
+    *addr_idx = addr_idx.saturating_add(1);
+    if *addr_idx >= addrs.len() {
+        *addr_idx = 0;
+    }
+    Rotation::NextAddress
+}
+
+/// Resolves every address the target currently answers with, in resolver
+/// order. Returning all of them is what lets a failing first entry be skipped
+/// without a second getaddrinfo.
+fn resolve(target: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let addrs: Vec<_> = target.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no address found for '{target}'"),
-        )
-    })
+        ));
+    }
+    Ok(addrs)
+}
+
+fn join_addrs(addrs: &[std::net::SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn hostname() -> String {
@@ -162,4 +264,69 @@ fn hostname() -> String {
     // Sanitise: hostnames injected via orchestrators (k8s, cloud init) may
     // contain slashes, spaces, or other characters that break PUTVAL identifiers.
     cli::sanitize(&String::from_utf8_lossy(&buf[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_single_address_has_nowhere_to_rotate() {
+        let mut addrs = vec![addr("10.0.0.1:9999")];
+        let mut idx = 0;
+        let same = addrs.clone();
+        let r = apply_resolution(&mut addrs, &mut idx, same);
+        assert_eq!(r, Rotation::Unchanged);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn an_unreachable_first_answer_is_skipped_on_the_next_round() {
+        // The case this exists for: DNS keeps returning an AAAA that never
+        // connects, ahead of an A that does. Without rotation the probe stays
+        // pinned to the dead one forever.
+        let mut addrs = vec![addr("[::1]:9999"), addr("10.0.0.1:9999")];
+        let mut idx = 0;
+
+        let same = addrs.clone();
+        assert_eq!(
+            apply_resolution(&mut addrs, &mut idx, same.clone()),
+            Rotation::NextAddress
+        );
+        assert_eq!(addrs[idx], addr("10.0.0.1:9999"));
+
+        // And it wraps back rather than running off the end.
+        assert_eq!(
+            apply_resolution(&mut addrs, &mut idx, same),
+            Rotation::NextAddress
+        );
+        assert_eq!(addrs[idx], addr("[::1]:9999"));
+    }
+
+    #[test]
+    fn changed_answers_replace_the_list_and_reset_the_index() {
+        let mut addrs = vec![addr("10.0.0.1:9999"), addr("10.0.0.2:9999")];
+        let mut idx = 1;
+        let r = apply_resolution(&mut addrs, &mut idx, vec![addr("10.0.0.9:9999")]);
+        assert_eq!(r, Rotation::Replaced);
+        assert_eq!(addrs, vec![addr("10.0.0.9:9999")]);
+        assert_eq!(idx, 0, "a stale index would panic on the shorter list");
+    }
+
+    #[test]
+    fn resolve_returns_every_answer() {
+        let addrs = resolve("localhost:9999").unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.port() == 9999));
+    }
+
+    #[test]
+    fn resolve_reports_an_unknown_host_instead_of_returning_nothing() {
+        assert!(resolve("no-such-host.invalid:9999").is_err());
+    }
 }

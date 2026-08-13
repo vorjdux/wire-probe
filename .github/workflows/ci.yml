@@ -30,15 +30,20 @@ jobs:
         run: sudo apt-get install -y musl-tools
 
       - name: Build (musl static)
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: Clippy
-        run: cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
 
       # Runs on the host target: the musl tests would need a musl runner, and
       # these cover parsing and wire formats, which are target-independent.
       - name: Unit tests
-        run: cargo test
+        run: cargo test --locked
+
+      # The plugin is a separate implementation in Python; nothing above tests
+      # it. Stdlib unittest only, no pytest, so there is nothing to install.
+      - name: Collectd plugin tests
+        run: python3 -m unittest discover -s plugin/collectd -v
 
       - name: Confirm binary is fully static
         run: |
@@ -70,3 +75,25 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/wire-probe "$DIR/"
           tar czf "${DIR}.tar.gz" "$DIR/"
           tar tzf "${DIR}.tar.gz"
+
+      # The failure metric is the reason this project exists; assert the wire
+      # output, not just that the process printed an error.
+      - name: Smoke test  -  a failed probe still exports a value
+        run: |
+          ./target/x86_64-unknown-linux-musl/release/wire-probe \
+            --mode probe --target 127.0.0.1:1 \
+            --timeout 200ms --interval 5000ms \
+            --export collectd-exec 2>/dev/null | head -1 | grep -q "N:U$" \
+            && echo "OK" || (echo "FAIL: expected N:U for a failed probe" && exit 1)
+
+  # Guards rust-version in Cargo.toml: without this, the declared MSRV is a
+  # comment nobody checks, which is how it drifted to 1.70 before.
+  msrv:
+    name: MSRV 1.85
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test on the declared minimum
+        run: cargo test --locked

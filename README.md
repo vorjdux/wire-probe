@@ -112,6 +112,13 @@ systemctl status wire-probe-server
 The unit assumes the binary is at `/usr/local/bin/wire-probe` (the default
 `install.sh` location when run as root) and restarts on failure with backoff.
 
+It runs under `DynamicUser=yes` with a locked-down sandbox: no capabilities, a
+read-only filesystem, `AF_INET`/`AF_INET6` only, and `SystemCallFilter=@system-service`
+(which nests `@aio`, where the `io_uring` syscalls live). `systemd-analyze
+security` rates it 1.3 OK, against 9.4 UNSAFE for the same unit unhardened.
+Binding a port below 1024 needs `CAP_NET_BIND_SERVICE` added back  -  see the
+commented lines in the unit.
+
 ### Probe mode
 
 Runs on the observer host. Measures the TCP handshake RTT to the target and
@@ -142,8 +149,19 @@ wire-probe --mode probe --target <host:port> [options]
 Sends one UDP datagram per probe in [Influx Line Protocol](https://docs.influxdata.com/influxdb/cloud/reference/syntax/line-protocol/) format:
 
 ```
-tcp_latency,target=mdb_primary,az=eu-west rtt_ms=4.12 1686561230000000000
+tcp_latency,target=mdb_primary,az=eu-west rtt_ms=4.12,success=1i 1686561230000000000
 ```
+
+A failed probe still emits a point, carrying `success=0i` and no `rtt_ms`:
+
+```
+tcp_latency,target=mdb_primary,az=eu-west success=0i 1686561231000000000
+```
+
+This is deliberate. Over fire-and-forget UDP a missing point is
+indistinguishable from a lost datagram, so alerting on absence cannot separate
+"target down" from "probe down". Alert on `success` instead, and note that
+`rtt_ms` is absent rather than zero on failure, so averages stay clean.
 
 Telegraf configuration:
 
@@ -166,6 +184,12 @@ Writes `PUTVAL` lines to stdout. Use with collectd's
 
 ```
 PUTVAL hostname/wire-probe-tcp/latency-mdb_primary interval=10 N:4.12
+```
+
+A failed probe sends `N:U`, collectd's "undefined" marker, rather than nothing:
+
+```
+PUTVAL hostname/wire-probe-tcp/latency-mdb_primary interval=10 N:U
 ```
 
 ```xml
@@ -247,7 +271,8 @@ the full configuration reference.
 
 ## Build from source
 
-Requires Rust 1.70+ and Linux kernel ≥ 5.1 (for `io_uring`).
+Requires Rust 1.85+ (the crate is on `edition = "2024"`) and Linux kernel
+>= 5.1 (for `io_uring`).
 
 ```bash
 git clone https://github.com/vorjdux/wire-probe
@@ -292,7 +317,11 @@ To guarantee the export hot path runs within the CPU's L1/L2 caches and avoids m
 
 ### 3. Fire-and-Forget Export and Backpressure Offloading
 
-An observability probe must never crash or block because the downstream telemetry pipeline degraded.
+An observability probe must not block, and must not be brought down, because the
+downstream telemetry pipeline degraded. Note that the release profile sets
+`panic = "abort"`, so a panic terminates the process rather than unwinding  -  the
+guarantee is that no export path *blocks* or propagates backpressure, not that the
+process is panic-proof. Restart supervision is the systemd unit's job.
 
 - By forcing metric injection via UDP datagrams (Telegraf/Influx) or Unix domain sockets (Collectd), `wire-probe` structurally outsources backpressure handling to the Linux kernel.
 - If the destination TSDB stalls or the Telegraf process hangs, the kernel applies a silent tail-drop at the receive buffer. This isolates the probe, shielding it from file descriptor exhaustion or OOM kills.

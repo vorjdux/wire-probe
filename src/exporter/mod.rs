@@ -40,4 +40,13 @@ impl Exporter {
             Self::Collectd(e) => e.send(rtt_ms),
         }
     }
+
+    /// Reports a failed probe. Every probe emits a point so that a target
+    /// going down is a value change, not an absence of data.
+    pub fn send_failure(&mut self, ts_ns: u64) -> io::Result<()> {
+        match self {
+            Self::Telegraf(e) => e.send_failure(ts_ns),
+            Self::Collectd(e) => e.send_failure(),
+        }
+    }
 }

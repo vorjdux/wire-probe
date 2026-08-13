@@ -20,10 +20,23 @@ import time
 
 PLUGIN_NAME = "wire_probe"
 
-# Total wall-clock budget for one read_cb invocation across all hosts.
-# Keeps the callback under collectd's default 10s Interval regardless of
-# how many hosts or samples are configured.
-_READ_BUDGET_S = 8.0
+# Fraction of the configured collectd Interval that one read_cb invocation may
+# consume across all hosts. Derived from the live Interval rather than fixed:
+# with "Interval 1" a hardcoded 8s budget would block collectd's read thread
+# for eight times its own cycle.
+_READ_BUDGET_RATIO = 0.8
+# Used only if collectd.get_interval() is unavailable (older collectd).
+_FALLBACK_INTERVAL_S = 10.0
+
+
+def _read_budget():
+    try:
+        interval = float(collectd.get_interval())
+    except (AttributeError, TypeError, ValueError):
+        interval = _FALLBACK_INTERVAL_S
+    if interval <= 0:
+        interval = _FALLBACK_INTERVAL_S
+    return interval * _READ_BUDGET_RATIO
 
 _hosts = []       # list of (display_name, host, port)
 _timeout = 5.0
@@ -112,7 +125,15 @@ def config_cb(conf):
                     hostname, port = raw, None  # resolve port later
             else:
                 hostname, port = raw, None
-            _hosts.append((raw, hostname, port))
+            # De-duplicate rather than reset the list: collectd calls this once
+            # per <Module wire_probe> block, so clearing would discard all but
+            # the last block, while blind appending probes a repeated target
+            # once per duplicate entry.
+            entry = (raw, hostname, port)
+            if entry in _hosts:
+                collectd.warning(f"{PLUGIN_NAME}: duplicate Host '{raw}', ignoring")
+            else:
+                _hosts.append(entry)
 
         elif key == "port":
             port_val = int(node.values[0])
@@ -153,9 +174,9 @@ def read_cb():
     ping_count = _ping_count
     default_port = _default_port
 
-    # Hard deadline: stop probing when the global budget is exhausted so
-    # this callback never blocks collectd's read thread past _READ_BUDGET_S.
-    deadline = time.monotonic() + _READ_BUDGET_S
+    # Hard deadline: stop probing when the global budget is exhausted so this
+    # callback never blocks collectd's read thread for most of its Interval.
+    deadline = time.monotonic() + _read_budget()
 
     for display, hostname, host_port in _hosts:
         port = host_port if host_port is not None else default_port

@@ -5,6 +5,10 @@ use std::os::unix::net::UnixStream;
 ///
 /// Format: `PUTVAL <host>/wire-probe-tcp/latency-<target> interval=<n> N:<rtt_ms>`
 ///
+/// A failed probe sends `N:U`  -  collectd's "undefined" marker, the same thing
+/// the ping plugin dispatches on loss. That keeps the series ticking at a known
+/// timestamp instead of leaving a gap that could equally mean the probe died.
+///
 /// The static prefix is built once; only the float value is formatted per send.
 pub struct CollectdExporter {
     dest: Dest,
@@ -47,10 +51,32 @@ impl CollectdExporter {
         let mut ryu_buf = ryu::Buffer::new();
         self.buf
             .extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
+
+        self.flush_line()
+    }
+
+    /// Sends `N:U` (undefined) for a failed probe.
+    pub fn send_failure(&mut self) -> io::Result<()> {
+        self.buf.clear();
+        self.buf.extend_from_slice(&self.prefix);
+        self.buf.push(b'U');
+
+        self.flush_line()
+    }
+
+    fn flush_line(&mut self) -> io::Result<()> {
         self.buf.push(b'\n');
 
         match &mut self.dest {
-            Dest::Exec => io::stdout().write_all(&self.buf),
+            Dest::Exec => {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                lock.write_all(&self.buf)?;
+                // Stdout is line-buffered only when attached to a terminal;
+                // under the Exec plugin it is a pipe, so flush explicitly
+                // rather than relying on the trailing newline.
+                lock.flush()
+            }
             Dest::Uds(stream) => stream.write_all(&self.buf),
         }
     }

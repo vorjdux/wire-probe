@@ -4,9 +4,17 @@ use std::net::UdpSocket;
 /// Formats and ships Influx Line Protocol measurements to a Telegraf
 /// `[[inputs.socket_listener]]` UDP endpoint.
 ///
-/// The static prefix (`tcp_latency,target=<name>,az=<az> rtt_ms=`) is built
-/// once at construction; only the float value and timestamp are formatted on
-/// each send, with zero heap allocation on the hot path.
+/// The static prefix (`tcp_latency,target=<name>,az=<az> `) is built once at
+/// construction; only the float value and timestamp are formatted on each
+/// send, with zero heap allocation on the hot path.
+///
+/// Every probe emits a point, successful or not:
+///   success:  `tcp_latency,target=x,az=y rtt_ms=4.12,success=1i <ts>`
+///   failure:  `tcp_latency,target=x,az=y success=0i <ts>`
+///
+/// A failed probe must produce a value rather than a gap: over fire-and-forget
+/// UDP a missing point is indistinguishable from a lost datagram, so alerting
+/// on absence cannot tell "target down" from "exporter down".
 pub struct TelegrafExporter {
     socket: UdpSocket,
     prefix: Vec<u8>,
@@ -23,7 +31,7 @@ impl TelegrafExporter {
         prefix.extend_from_slice(target_name.as_bytes());
         prefix.extend_from_slice(b",az=");
         prefix.extend_from_slice(az.as_bytes());
-        prefix.extend_from_slice(b" rtt_ms=");
+        prefix.push(b' ');
 
         Ok(Self {
             socket,
@@ -32,14 +40,31 @@ impl TelegrafExporter {
         })
     }
 
-    /// Sends one measurement. `ts_ns` is nanoseconds since UNIX epoch.
+    /// Sends one successful measurement. `ts_ns` is nanoseconds since UNIX epoch.
     pub fn send(&mut self, rtt_ms: f64, ts_ns: u64) -> io::Result<()> {
         self.buf.clear();
         self.buf.extend_from_slice(&self.prefix);
 
+        self.buf.extend_from_slice(b"rtt_ms=");
         let mut ryu_buf = ryu::Buffer::new();
         self.buf
             .extend_from_slice(ryu_buf.format(rtt_ms).as_bytes());
+        self.buf.extend_from_slice(b",success=1i");
+
+        self.finish(ts_ns)
+    }
+
+    /// Sends a failed probe: `success=0i` with no `rtt_ms` field, so averages
+    /// over `rtt_ms` stay uncontaminated by a sentinel value.
+    pub fn send_failure(&mut self, ts_ns: u64) -> io::Result<()> {
+        self.buf.clear();
+        self.buf.extend_from_slice(&self.prefix);
+        self.buf.extend_from_slice(b"success=0i");
+
+        self.finish(ts_ns)
+    }
+
+    fn finish(&mut self, ts_ns: u64) -> io::Result<()> {
         self.buf.push(b' ');
 
         let mut itoa_buf = itoa::Buffer::new();

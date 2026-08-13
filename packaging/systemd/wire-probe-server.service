@@ -8,6 +8,46 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=/usr/local/bin/wire-probe --mode server --port 9999
 
+# Hardening. The server opens one listening socket and accepts/drops SYNs:
+# it reads no files, writes nothing to disk, spawns nothing, and needs no
+# privileged port at the default 9999. So it gets none of that.
+# Verify with: systemd-analyze security wire-probe-server.service
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# io_uring_setup/enter/register come in via @aio, which @system-service nests.
+# Verified by running the server under this filter and probing it.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryMax=64M
+TasksMax=16
+
+# A port below 1024 needs the capability back; uncomment both lines and drop
+# CapabilityBoundingSet= above:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 Restart=always
 RestartSec=1
 # Exponential backoff 1s -> 10m over 5 steps. RestartMaxDelaySec/RestartSteps

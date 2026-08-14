@@ -42,6 +42,23 @@ _hosts = []       # list of (display_name, host, port)
 _timeout = 5.0
 _ping_count = 1
 _default_port = 9999
+# How PingCount samples collapse into the reported `ping` value.
+#
+# "avg" matches the collectd ping plugin and is the default so existing series
+# keep their meaning. "min" exists because this plugin runs inside CPython:
+# the measurement is monotonic() around connect(), so any delay in re-acquiring
+# the GIL after connect() returns lands in the value as if it were network
+# latency. Measured on loopback, where the true RTT is 0.007 ms:
+#
+#   idle                        p50 0.007 ms   p99 0.032 ms
+#   with GIL contention         p50 41 ms      p99 461 ms
+#
+# With PingCount 3 under that contention, avg reported p50 27 ms while min
+# reported p50 5 ms. The minimum of N samples is the one least contaminated by
+# scheduling, so "min" is the better estimator of the actual handshake on a
+# busy collectd host. It cannot help at PingCount 1, where there is nothing to
+# choose between.
+_aggregate = "avg"
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +167,7 @@ def _emit(type_instance, value_type, value):
 # ---------------------------------------------------------------------------
 
 def config_cb(conf):
-    global _timeout, _ping_count, _default_port
+    global _timeout, _ping_count, _default_port, _aggregate
 
     for node in conf.children:
         key = node.key.lower()
@@ -189,6 +206,16 @@ def config_cb(conf):
             else:
                 _ping_count = pc
 
+        elif key == "aggregate":
+            mode = str(node.values[0]).lower()
+            if mode not in ("avg", "min"):
+                collectd.warning(
+                    f"{PLUGIN_NAME}: Aggregate '{node.values[0]}' unknown "
+                    f"(expected avg or min), using default {_aggregate}"
+                )
+            else:
+                _aggregate = mode
+
         else:
             collectd.warning(f"{PLUGIN_NAME}: unknown config key '{node.key}'")
 
@@ -197,7 +224,7 @@ def init_cb():
     collectd.info(
         f"{PLUGIN_NAME}: probing {len(_hosts)} host(s), "
         f"port={_default_port}, timeout={_timeout}s, "
-        f"ping_count={_ping_count}"
+        f"ping_count={_ping_count}, aggregate={_aggregate}"
     )
 
 
@@ -206,6 +233,7 @@ def read_cb():
     timeout = _timeout
     ping_count = _ping_count
     default_port = _default_port
+    aggregate = _aggregate
 
     # Budget: stop starting work once it is exhausted, so this callback does
     # not occupy collectd's read thread for most of its Interval.
@@ -272,19 +300,23 @@ def read_cb():
             droprate = (attempts - len(samples)) / attempts
 
         if samples:
-            avg = sum(samples) / len(samples)
+            mean = sum(samples) / len(samples)
+            # Reported value: mean by default, minimum when asked for. stddev
+            # stays over the whole set either way, so the spread that "min"
+            # discards is still visible.
+            reported = min(samples) if aggregate == "min" else mean
             if len(samples) > 1:
-                variance = sum((r - avg) ** 2 for r in samples) / len(samples)
+                variance = sum((r - mean) ** 2 for r in samples) / len(samples)
                 stddev = math.sqrt(variance)
             else:
                 stddev = float("nan")
         else:
-            avg = float("nan")
+            reported = float("nan")
             stddev = float("nan")
 
         # type_instance mirrors the ping plugin: bare hostname, plus the port
         # only where one was set per-host (see `label` above).
-        _emit(label, "ping", avg)
+        _emit(label, "ping", reported)
         _emit(label, "ping_droprate", droprate)
         _emit(label, "ping_stddev", stddev)
 

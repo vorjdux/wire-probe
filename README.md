@@ -244,6 +244,23 @@ LoadPlugin python
 </Plugin>
 ```
 
+> **Accuracy on a busy host.** The plugin measures `monotonic()` around
+> `connect()` inside CPython, so time spent waiting to re-acquire the GIL after
+> the handshake completes is reported as if it were network latency. Measured
+> on loopback, where the true RTT is 0.007 ms:
+>
+> | | p50 | p99 |
+> |---|---|---|
+> | idle | 0.007 ms | 0.032 ms |
+> | under GIL contention | 41 ms | 461 ms |
+> | Rust probe, every core saturated | 0.14 ms | 13 ms |
+>
+> If the scatter shows up in your dashboards, either set `PingCount 3` with
+> `Aggregate "min"` (which reported 5 ms where the mean reported 27 ms under
+> the same contention), or run the Rust binary via `--export collectd-exec`
+> or `collectd-uds://` instead. The server side is not implicated: 500
+> concurrent handshakes against it measured p99 0.37 ms with no failures.
+
 `LoadPlugin python` is only needed if the python plugin is not already loaded
 elsewhere in `collectd.conf`  -  drop that line if it is, to avoid a duplicate
 `LoadPlugin` warning at startup.

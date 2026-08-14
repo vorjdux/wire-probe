@@ -281,6 +281,47 @@ class TestReadCb(unittest.TestCase):
             f"unattempted host claimed loss: {by_host}",
         )
 
+    def test_aggregate_min_reports_the_least_contaminated_sample(self):
+        # One clean handshake among three delayed ones is what a busy CPython
+        # looks like: avg is dragged up, min recovers the real number.
+        real = wire_probe._tcp_rtt
+        rtts = iter([50.0, 0.5, 40.0])
+        wire_probe._resolve_backup = wire_probe._resolve
+        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._tcp_rtt = lambda _a, _t: next(rtts)
+        wire_probe._hosts = [("h", "h", None)]
+        wire_probe._ping_count = 3
+        try:
+            wire_probe._aggregate = "min"
+            wire_probe.read_cb()
+            self.assertAlmostEqual(self.values()["ping"], 0.5)
+        finally:
+            wire_probe._tcp_rtt = real
+            wire_probe._resolve = wire_probe._resolve_backup
+            wire_probe._aggregate = "avg"
+            wire_probe._ping_count = 1
+
+    def test_aggregate_defaults_to_avg_so_existing_series_do_not_move(self):
+        real = wire_probe._tcp_rtt
+        rtts = iter([50.0, 0.5, 40.0])
+        wire_probe._resolve_backup = wire_probe._resolve
+        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._tcp_rtt = lambda _a, _t: next(rtts)
+        wire_probe._hosts = [("h", "h", None)]
+        wire_probe._ping_count = 3
+        try:
+            wire_probe.read_cb()
+            self.assertAlmostEqual(self.values()["ping"], 30.166666666666668)
+        finally:
+            wire_probe._tcp_rtt = real
+            wire_probe._resolve = wire_probe._resolve_backup
+            wire_probe._ping_count = 1
+
+    def test_unknown_aggregate_is_rejected(self):
+        wire_probe.config_cb(Conf([Node("Aggregate", ["median"])]))
+        self.assertEqual(wire_probe._aggregate, "avg")
+        self.assertTrue(any("Aggregate" in w for w in WARNINGS))
+
     def test_host_on_the_global_port_keeps_the_bare_hostname(self):
         # Existing series must not be renamed.
         wire_probe._hosts = [("127.0.0.1", "127.0.0.1", None)]

@@ -1,6 +1,6 @@
 [package]
 name = "wire-probe"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 # Edition 2024 requires 1.85; without this Cargo fails with an opaque
 # "feature `edition2024` is required" instead of naming the toolchain.

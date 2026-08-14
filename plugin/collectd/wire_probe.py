@@ -54,6 +54,12 @@ _default_port = 9999
 # used and contention is a non-issue (0.036 ms measured under contention that
 # made the stopwatch read 41 ms).
 _aggregate = "avg"
+# Per-label index into the resolved address list, plus the run of consecutive
+# failures that drives rotation. Same policy as the Rust probe: stay on one
+# address while it works, and only move after a run of failures, so the
+# reported RTT keeps meaning "handshake with this endpoint".
+_addr_state = {}
+_ROTATE_AFTER_FAILURES = 5
 
 
 # ---------------------------------------------------------------------------
@@ -64,23 +70,61 @@ def _valid_port(port):
     return 1 <= port <= 65535
 
 
-def _resolve(host, port):
-    """Return (family, sockaddr) for the first address, or None on failure.
+def _resolve_all(host, port):
+    """Return every (family, sockaddr) the name answers with, or None.
 
     Resolution is deliberately kept OUT of the timed section: socket.
     create_connection() would fold getaddrinfo() into the measurement, so a
     cold DNS lookup shows up as multi-second "RTT" on the first read cycle.
-    Only the first address is used, mirroring the Rust probe (to_socket_addrs
-    followed by .next()).
+
+    All addresses are returned, not just the first, so a name whose first
+    answer never connects  -  classically an AAAA in front of a working A  -
+    can be worked past instead of failing forever. This mirrors the Rust probe.
     """
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError:
         return None
-    if not infos:
+    addrs = [(family, sockaddr) for family, _, _, _, sockaddr in infos]
+    return addrs or None
+
+
+def _resolve(host, port):
+    """First address only. Kept for callers that want a single endpoint."""
+    addrs = _resolve_all(host, port)
+    return addrs[0] if addrs else None
+
+
+def _preferred_address(label, addrs):
+    """Pick which resolved address to probe this cycle, or None."""
+    if not addrs:
         return None
-    family, _, _, _, sockaddr = infos[0]
-    return family, sockaddr
+    idx, failures = _addr_state.get(label, (0, 0))
+    if idx >= len(addrs):
+        # The list shrank since last cycle; a stale index would raise.
+        idx = 0
+    _addr_state[label] = (idx, failures)
+    return addrs[idx]
+
+
+def _record_outcome(label, addrs, succeeded):
+    """Advance to the next address after a run of failures."""
+    if not addrs:
+        return
+    idx, failures = _addr_state.get(label, (0, 0))
+    if succeeded:
+        _addr_state[label] = (idx, 0)
+        return
+    failures += 1
+    if failures < _ROTATE_AFTER_FAILURES or len(addrs) < 2:
+        _addr_state[label] = (idx, failures)
+        return
+    idx = (idx + 1) % len(addrs)
+    _addr_state[label] = (idx, 0)
+    collectd.warning(
+        f"{PLUGIN_NAME}: '{label}' failed {_ROTATE_AFTER_FAILURES} times, "
+        f"trying the next address {addrs[idx][1]}"
+    )
 
 
 # struct tcp_info (linux/tcp.h). Only early fields are read; the struct only
@@ -118,8 +162,13 @@ def _kernel_rtt_ms(sock):
     inflate it. Measured on loopback under GIL contention: the stopwatch
     reported a median of 41 ms, tcpi_rtt reported 0.035 ms.
 
-    A socket that has just connected carries exactly one RTT sample, so the
-    smoothed value the kernel reports is that handshake.
+    tcpi_rtt is the smoothed srtt, so it is only the handshake while the
+    connection carries exactly one sample. It does: the server's FIN normally
+    lands before this reads, but Linux takes an RTT sample only when an ACK
+    acknowledges data we sent, and a probe sends none. Measured over 200
+    connections against an accept-and-close server with tcp_timestamps=1:
+    every socket moved ESTABLISHED -> CLOSE_WAIT and tcpi_rtt changed in zero
+    of them.
     """
     if not hasattr(socket, "TCP_INFO"):
         return None
@@ -327,9 +376,10 @@ def read_cb():
 
         # Resolved once per read cycle, outside the timed section, and reused
         # for every sample. A resolution failure counts as a full drop.
-        addr_info = _resolve(hostname, port)
-        if addr_info is None:
+        addrs = _resolve_all(hostname, port)
+        if addrs is None:
             collectd.warning(f"{PLUGIN_NAME}: cannot resolve '{hostname}', counting as drop")
+        addr_info = _preferred_address(label, addrs)
 
         samples = []
         # Counted separately from ping_count: a probe that was never attempted
@@ -350,6 +400,8 @@ def read_cb():
             rtt = _tcp_rtt(addr_info, min(timeout, remaining))
             if rtt is not None:
                 samples.append(rtt)
+
+        _record_outcome(label, addrs, bool(samples))
 
         if addr_info is None:
             # Resolution failure is a real drop: the target cannot be reached.

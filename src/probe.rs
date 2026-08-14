@@ -35,6 +35,15 @@ const TCP_SYN_RECV: u8 = 3;
 /// Falls back to the wall clock where the kernel value is unavailable. The
 /// `--timeout` flag is the only bound on how long this call can block, and the
 /// socket is dropped immediately after  -  no data is ever sent or received.
+///
+/// `tcpi_rtt` is the smoothed srtt rather than the raw sample, so it is only
+/// the handshake while the connection carries exactly one sample. It does: the
+/// server's FIN normally lands before this reads, but Linux takes an RTT
+/// sample only when an ACK acknowledges data we sent, and a probe sends none.
+/// Measured over 200 connections against an accept-and-close server with
+/// `net.ipv4.tcp_timestamps=1`: every socket moved ESTABLISHED to `CLOSE_WAIT`
+/// and `tcpi_rtt` changed in zero of them. Sending payload would invalidate
+/// that, and `tcpi_min_rtt` would then be the field to read instead.
 #[expect(
     clippy::cast_precision_loss,
     reason = "f64 is exact for nanosecond counts below 2^53, i.e. any RTT under 104 days"
@@ -134,6 +143,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         assert!(kernel_rtt_ms(&stream).is_some());
+    }
+
+    #[test]
+    fn the_peers_fin_does_not_add_a_second_rtt_sample() {
+        // tcpi_rtt is the smoothed srtt, so it only equals the handshake while
+        // the connection carries one sample. The server closes immediately, so
+        // its FIN lands before the read; this asserts that arrival does not
+        // move the value. It would if the probe ever sent payload.
+        let srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = srv.local_addr().unwrap();
+
+        for _ in 0..50 {
+            let stream = TcpStream::connect(addr).unwrap();
+            let before = kernel_rtt_ms(&stream).expect("no kernel sample");
+            drop(srv.accept().unwrap().0);
+            std::thread::sleep(Duration::from_millis(5));
+            let after = kernel_rtt_ms(&stream).expect("no kernel sample after FIN");
+            assert!(
+                (before - after).abs() < f64::EPSILON,
+                "srtt moved after the FIN: {before} -> {after}"
+            );
+        }
     }
 
     #[test]

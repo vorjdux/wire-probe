@@ -37,13 +37,31 @@ jobs:
 
       # Runs on the host target: the musl tests would need a musl runner, and
       # these cover parsing and wire formats, which are target-independent.
+      #
+      # The count is asserted because a suite that stops being discovered  -
+      # a renamed file, a broken import, a mod that stops being compiled  -
+      # exits 0 and leaves this step green while testing nothing. That is the
+      # failure this project already shipped once.
       - name: Unit tests
-        run: cargo test --locked
+        run: |
+          set -o pipefail
+          cargo test --locked 2>&1 | tee cargo-test.log
+          grep -qE 'running [1-9][0-9]* tests?' cargo-test.log \
+            || { echo "::error::no Rust tests were discovered"; exit 1; }
 
       # The plugin is a separate implementation in Python; nothing above tests
       # it. Stdlib unittest only, no pytest, so there is nothing to install.
+      #
+      # unittest returns 5 for "no tests ran" only since Python 3.12; the
+      # ubuntu-22.04 runner ships 3.10, where it returns 0. Assert the count
+      # rather than depend on the runner's interpreter version.
       - name: Collectd plugin tests
-        run: python3 -m unittest discover -s plugin/collectd -v
+        run: |
+          set -o pipefail
+          python3 --version
+          python3 -m unittest discover -s plugin/collectd -v 2>&1 | tee plugin-test.log
+          grep -qE '^Ran [1-9][0-9]* tests?' plugin-test.log \
+            || { echo "::error::no collectd plugin tests were discovered"; exit 1; }
 
       - name: Confirm binary is fully static
         run: |

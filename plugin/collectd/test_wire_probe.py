@@ -182,6 +182,67 @@ class TestKernelRtt(unittest.TestCase):
         self.assertGreater(rtt, 0.0)
 
 
+class TestAddressRotation(unittest.TestCase):
+    """Parity with the Rust probe: a dead first answer must be worked past."""
+
+    def setUp(self):
+        wire_probe._addr_state.clear()
+
+    def tearDown(self):
+        wire_probe._addr_state.clear()
+
+    def test_resolve_all_returns_every_answer(self):
+        addrs = wire_probe._resolve_all("localhost", 9999)
+        self.assertTrue(addrs)
+        self.assertTrue(all(len(a) == 2 for a in addrs))
+
+    def test_stays_put_while_the_address_works(self):
+        addrs = [("A", "first"), ("B", "second")]
+        for _ in range(20):
+            self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
+            wire_probe._record_outcome("h", addrs, succeeded=True)
+
+    def test_moves_on_after_a_run_of_failures(self):
+        # The case this exists for: DNS keeps answering with an AAAA that never
+        # connects, ahead of an A that does.
+        addrs = [("AAAA", "dead"), ("A", "alive")]
+        for _ in range(wire_probe._ROTATE_AFTER_FAILURES - 1):
+            self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
+            wire_probe._record_outcome("h", addrs, succeeded=False)
+        # The last failure of the run flips it.
+        wire_probe._record_outcome("h", addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[1])
+
+    def test_a_single_address_never_rotates(self):
+        addrs = [("A", "only")]
+        for _ in range(wire_probe._ROTATE_AFTER_FAILURES * 3):
+            wire_probe._record_outcome("h", addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
+
+    def test_a_success_resets_the_failure_run(self):
+        addrs = [("A", "first"), ("B", "second")]
+        for _ in range(wire_probe._ROTATE_AFTER_FAILURES - 1):
+            wire_probe._record_outcome("h", addrs, succeeded=False)
+        wire_probe._record_outcome("h", addrs, succeeded=True)
+        wire_probe._record_outcome("h", addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
+
+    def test_a_shrinking_answer_list_does_not_raise(self):
+        # DNS can return fewer addresses than last cycle; a stale index would
+        # be an IndexError inside collectd's read thread.
+        addrs = [("A", "one"), ("B", "two"), ("C", "three")]
+        for _ in range(wire_probe._ROTATE_AFTER_FAILURES * 2):
+            wire_probe._record_outcome("h", addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address("h", [("A", "one")]), ("A", "one"))
+
+    def test_hosts_rotate_independently(self):
+        addrs = [("A", "first"), ("B", "second")]
+        for _ in range(wire_probe._ROTATE_AFTER_FAILURES):
+            wire_probe._record_outcome("h1", addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address("h1", addrs), addrs[1])
+        self.assertEqual(wire_probe._preferred_address("h2", addrs), addrs[0])
+
+
 class TestConfig(unittest.TestCase):
     def setUp(self):
         wire_probe._hosts.clear()
@@ -311,35 +372,35 @@ class TestReadCb(unittest.TestCase):
         # Regression guard: dividing drops by PingCount instead of by attempts
         # made the plugin's own budget look like loss. Two handshakes succeed,
         # the third never runs, and droprate must stay 0.
-        real_resolve, real_rtt = wire_probe._resolve, wire_probe._tcp_rtt
+        real_resolve, real_rtt = wire_probe._resolve_all, wire_probe._tcp_rtt
         _collectd.get_interval = lambda: 1.0  # 0.8s budget
 
         def slow_success(_addr_info, _timeout):
             time.sleep(0.5)
             return 500.0
 
-        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._resolve_all = lambda _h, _p: [("fake", "addr")]
         wire_probe._tcp_rtt = slow_success
         wire_probe._hosts = [("h", "h", None)]
         wire_probe._ping_count = 3
         try:
             wire_probe.read_cb()
         finally:
-            wire_probe._resolve, wire_probe._tcp_rtt = real_resolve, real_rtt
+            wire_probe._resolve_all, wire_probe._tcp_rtt = real_resolve, real_rtt
             _collectd.get_interval = lambda: 10.0
             wire_probe._ping_count = 1
 
         self.assertEqual(self.values()["ping_droprate"], 0.0)
 
     def test_nothing_attempted_reports_no_droprate_rather_than_total_loss(self):
-        real_resolve, real_rtt = wire_probe._resolve, wire_probe._tcp_rtt
+        real_resolve, real_rtt = wire_probe._resolve_all, wire_probe._tcp_rtt
         _collectd.get_interval = lambda: 1.0
 
         def burn_the_budget(_addr_info, _timeout):
             time.sleep(1.0)
             return 1000.0
 
-        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._resolve_all = lambda _h, _p: [("fake", "addr")]
         wire_probe._tcp_rtt = burn_the_budget
         # First host eats the budget; the second never gets a handshake.
         wire_probe._hosts = [("a", "a", None), ("b", "b", None)]
@@ -347,7 +408,7 @@ class TestReadCb(unittest.TestCase):
         try:
             wire_probe.read_cb()
         finally:
-            wire_probe._resolve, wire_probe._tcp_rtt = real_resolve, real_rtt
+            wire_probe._resolve_all, wire_probe._tcp_rtt = real_resolve, real_rtt
             _collectd.get_interval = lambda: 10.0
 
         by_host = {ti: v for t, ti, v in DISPATCHED if t == "ping_droprate"}
@@ -362,8 +423,8 @@ class TestReadCb(unittest.TestCase):
         # looks like: avg is dragged up, min recovers the real number.
         real = wire_probe._tcp_rtt
         rtts = iter([50.0, 0.5, 40.0])
-        wire_probe._resolve_backup = wire_probe._resolve
-        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._resolve_all_backup = wire_probe._resolve_all
+        wire_probe._resolve_all = lambda _h, _p: [("fake", "addr")]
         wire_probe._tcp_rtt = lambda _a, _t: next(rtts)
         wire_probe._hosts = [("h", "h", None)]
         wire_probe._ping_count = 3
@@ -373,15 +434,15 @@ class TestReadCb(unittest.TestCase):
             self.assertAlmostEqual(self.values()["ping"], 0.5)
         finally:
             wire_probe._tcp_rtt = real
-            wire_probe._resolve = wire_probe._resolve_backup
+            wire_probe._resolve_all = wire_probe._resolve_all_backup
             wire_probe._aggregate = "avg"
             wire_probe._ping_count = 1
 
     def test_aggregate_defaults_to_avg_so_existing_series_do_not_move(self):
         real = wire_probe._tcp_rtt
         rtts = iter([50.0, 0.5, 40.0])
-        wire_probe._resolve_backup = wire_probe._resolve
-        wire_probe._resolve = lambda _h, _p: ("fake", "addr")
+        wire_probe._resolve_all_backup = wire_probe._resolve_all
+        wire_probe._resolve_all = lambda _h, _p: [("fake", "addr")]
         wire_probe._tcp_rtt = lambda _a, _t: next(rtts)
         wire_probe._hosts = [("h", "h", None)]
         wire_probe._ping_count = 3
@@ -390,7 +451,7 @@ class TestReadCb(unittest.TestCase):
             self.assertAlmostEqual(self.values()["ping"], 30.166666666666668)
         finally:
             wire_probe._tcp_rtt = real
-            wire_probe._resolve = wire_probe._resolve_backup
+            wire_probe._resolve_all = wire_probe._resolve_all_backup
             wire_probe._ping_count = 1
 
     def test_unknown_aggregate_is_rejected(self):

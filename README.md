@@ -18,8 +18,9 @@ latency a real client sees  -  with no kernel module, no eBPF, no agent framewor
   flight, so a rate high enough to fill the listen backlog delays handshakes
   rather than growing memory. Falls back to blocking `accept()` where
   `io_uring` is unavailable
-- **Probe mode**  -  blocking `TcpStream::connect_timeout` wrapped with
-  `std::time::Instant`; the `--timeout` flag is the only timing bound
+- **Probe mode**  -  blocking `TcpStream::connect_timeout`, with the RTT read
+  from the kernel (`TCP_INFO.tcpi_rtt`) rather than timed in userspace; the
+  `--timeout` flag is the only timing bound
 - **Fire-and-forget export**  -  UDP (Telegraf Influx Line Protocol) or Unix
   domain socket / stdout (Collectd PUTVAL); no buffering, no retries
 - **Single static binary**  -  musl-linked, ~490 KB stripped, zero glibc version
@@ -343,7 +344,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 Including a standard async runtime (like `tokio`) imposes an unacceptable baseline memory footprint (2–5 MB RSS) and scheduler overhead for a binary whose sole purpose is handling socket file descriptors.
 
 - **Server mode (`io_uring`):** The TCP accept loop is submitted to the Linux kernel's asynchronous submission/completion queues via `io_uring`. The daemon maintains an RSS around ~460 KB regardless of load because there are no per-connection allocations  -  accepted fds are closed immediately with a plain `libc::close`. Note: the current implementation uses a single outstanding accept (serial re-arm per connection); throughput is bounded by one `submit_and_wait` syscall per connection, which is sufficient for telemetry use but not for high-PPS scenarios.
-- **Probe mode (native blocking):** Uses `TcpStream::connect_timeout` on a blocking thread. The `--timeout` flag is the only timing bound  -  it maps directly to the OS-level connect timeout. The RTT is captured by `Instant::now()` around the connect call; no other mechanism is involved. DNS is resolved once at startup to avoid per-tick `getaddrinfo` blocking inside the measurement loop.
+- **Probe mode (native blocking):** Uses `TcpStream::connect_timeout` on a blocking thread. The `--timeout` flag is the only timing bound  -  it maps directly to the OS-level connect timeout. The RTT itself is read from the kernel via `TCP_INFO.tcpi_rtt`, which measures the SYN → SYN-ACK exchange; `Instant::now()` around the connect call is the fallback for when the kernel has no sample, and the value used when the handshake needed a SYN retransmission, since the kernel's smoothed RTT would hide that wait. DNS is resolved at startup, outside the measurement, and every returned address is kept: after five consecutive failures the probe re-resolves and moves to the next one, so an unreachable AAAA in front of a working A recovers instead of pinning the process forever.
 
 ### 2. Zero-Allocation Export Path and Binary Density
 

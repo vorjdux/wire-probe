@@ -77,6 +77,9 @@ fn kernel_rtt_ms(stream: &TcpStream) -> Option<f64> {
 /// Applies the acceptance rules to a raw `tcp_info` blob. Split from the
 /// syscall so the rules are testable against a blob with fields rewritten,
 /// which is the only way to exercise the retransmission case without root.
+/// Native byte order throughout: this is a kernel struct copied into user
+/// memory by getsockopt, not anything that crossed a wire, so `from_ne_bytes`
+/// is the correct reading and not an unspecified-endianness bug.
 fn rtt_from_blob(buf: &[u8]) -> Option<f64> {
     if buf.len() < TCP_INFO_RETRANS_OFFSET + 4 {
         return None;

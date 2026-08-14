@@ -155,6 +155,8 @@ fn push_accept(ring: &mut IoUring, fd: i32) -> std::io::Result<()> {
     // nothing must outlive this call for the kernel to read.
     unsafe {
         ring.submission()
+            // Nothing is discarded by the wildcard: io_uring's PushError
+            // carries no payload, it only means the submission queue is full.
             .push(&sqe)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "SQ full"))?;
     }

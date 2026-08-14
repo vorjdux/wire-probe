@@ -260,7 +260,16 @@ LoadPlugin python
 > | Rust probe, every core saturated | 0.038 ms | 0.064 ms | 0.07 ms |
 >
 > The kernel value is used whenever it is available, with the wall clock as a
-> fallback (non-Linux, or a socket with no sample yet). `Aggregate "min"`
+> fallback: non-Linux, a socket with no sample yet, or a handshake whose SYN
+> was retransmitted. That last case matters  -  the kernel's smoothed RTT
+> reflects the exchange that finally succeeded, so on partial packet loss it
+> would report ~1 ms for a connect that really waited out a second-long RTO,
+> hiding exactly what this probe exists to catch. `tcpi_total_retrans` is
+> checked and the wall clock wins there. Verified with `tc qdisc add dev lo
+> root netem loss 25%`: a clean loopback reported p50 0.035 ms, and under loss
+> the same probe reported p50 1023 ms with a maximum of 2054 ms  -  one and two
+> SYN retransmission timeouts, exactly the wait the kernel value would have
+> hidden. `Aggregate "min"`
 > exists for that fallback path, where the minimum of `PingCount` samples is
 > the one least contaminated by scheduling.
 >

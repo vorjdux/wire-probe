@@ -10,6 +10,7 @@ sockets, real getaddrinfo, real read_cb.
 import math
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -140,6 +141,31 @@ class TestKernelRtt(unittest.TestCase):
             self.assertIsNotNone(
                 wire_probe._kernel_rtt_ms(s),
                 f"kernel RTT rejected in TCP state {state}",
+            )
+        finally:
+            s.close()
+
+    def test_a_retransmitted_syn_falls_back_to_the_wall_clock(self):
+        # Cannot drop a real SYN without root, so the retransmit counter is
+        # injected into a genuine TCP_INFO blob. The point is that the kernel
+        # RTT is refused when the handshake needed a retransmission, because
+        # its smoothed value hides the RTO the client actually waited out.
+        s = socket.socket()
+        s.connect(("127.0.0.1", self.port))
+        try:
+            real_blob = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+            self.assertIsNotNone(wire_probe._kernel_rtt_ms(s), "baseline should work")
+
+            patched = bytearray(real_blob)
+            struct.pack_into("=I", patched, wire_probe._TCP_INFO_RETRANS_OFFSET, 1)
+
+            class Fake:
+                def getsockopt(self, *_a):
+                    return bytes(patched)
+
+            self.assertIsNone(
+                wire_probe._kernel_rtt_ms(Fake()),
+                "kernel RTT must be refused once a SYN was retransmitted",
             )
         finally:
             s.close()

@@ -91,8 +91,12 @@ def _resolve(host, port):
 #     24  u32 x5  unacked, sacked, lost, retrans, fackets
 #     44  u32 x4  last_data_sent, last_ack_sent, last_data_recv, last_ack_recv
 #     60  u32 x4  pmtu, rcv_ssthresh, rtt, rttvar
+#     76  u32 x6  snd_ssthresh, snd_cwnd, advmss, reordering, rcv_rtt,
+#                 rcv_space
+#     100 u32     total_retrans
 _TCP_INFO_RTT_OFFSET = 68
-_TCP_INFO_MIN_LEN = _TCP_INFO_RTT_OFFSET + 4
+_TCP_INFO_RETRANS_OFFSET = 100
+_TCP_INFO_MIN_LEN = _TCP_INFO_RETRANS_OFFSET + 4
 # States in which no handshake has completed, so tcpi_rtt carries no sample.
 # Everything else is accepted, including CLOSE_WAIT: the wire-probe server
 # accepts and closes immediately, so by the time this process is scheduled to
@@ -125,6 +129,16 @@ def _kernel_rtt_ms(sock):
         return None
     if len(raw) < _TCP_INFO_MIN_LEN or raw[0] in (_TCP_SYN_SENT, _TCP_SYN_RECV):
         return None
+
+    # A retransmitted SYN means the handshake really did take longer than one
+    # round trip: the client waited out an RTO, typically a second. The
+    # kernel's smoothed RTT reflects the exchange that finally succeeded, so
+    # trusting it here would erase exactly the partial packet loss this probe
+    # exists to catch. Fall back to the wall clock, which contains the wait.
+    (total_retrans,) = struct.unpack_from("=I", raw, _TCP_INFO_RETRANS_OFFSET)
+    if total_retrans:
+        return None
+
     (rtt_us,) = struct.unpack_from("=I", raw, _TCP_INFO_RTT_OFFSET)
     # 0 means the kernel has no sample yet; fall back rather than report zero.
     return rtt_us / 1_000.0 if rtt_us else None

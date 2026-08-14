@@ -199,48 +199,83 @@ class TestAddressRotation(unittest.TestCase):
     def test_stays_put_while_the_address_works(self):
         addrs = [("A", "first"), ("B", "second")]
         for _ in range(20):
-            self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
-            wire_probe._record_outcome("h", addrs, succeeded=True)
+            self.assertEqual(wire_probe._preferred_address(("h", 9999), addrs), addrs[0])
+            wire_probe._record_outcome(("h", 9999), addrs, succeeded=True)
 
     def test_moves_on_after_a_run_of_failures(self):
         # The case this exists for: DNS keeps answering with an AAAA that never
         # connects, ahead of an A that does.
         addrs = [("AAAA", "dead"), ("A", "alive")]
         for _ in range(wire_probe._ROTATE_AFTER_FAILURES - 1):
-            self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
-            wire_probe._record_outcome("h", addrs, succeeded=False)
+            self.assertEqual(wire_probe._preferred_address(("h", 9999), addrs), addrs[0])
+            wire_probe._record_outcome(("h", 9999), addrs, succeeded=False)
         # The last failure of the run flips it.
-        wire_probe._record_outcome("h", addrs, succeeded=False)
-        self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[1])
+        wire_probe._record_outcome(("h", 9999), addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address(("h", 9999), addrs), addrs[1])
 
     def test_a_single_address_never_rotates(self):
         addrs = [("A", "only")]
         for _ in range(wire_probe._ROTATE_AFTER_FAILURES * 3):
-            wire_probe._record_outcome("h", addrs, succeeded=False)
-        self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
+            wire_probe._record_outcome(("h", 9999), addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address(("h", 9999), addrs), addrs[0])
 
     def test_a_success_resets_the_failure_run(self):
         addrs = [("A", "first"), ("B", "second")]
         for _ in range(wire_probe._ROTATE_AFTER_FAILURES - 1):
-            wire_probe._record_outcome("h", addrs, succeeded=False)
-        wire_probe._record_outcome("h", addrs, succeeded=True)
-        wire_probe._record_outcome("h", addrs, succeeded=False)
-        self.assertEqual(wire_probe._preferred_address("h", addrs), addrs[0])
+            wire_probe._record_outcome(("h", 9999), addrs, succeeded=False)
+        wire_probe._record_outcome(("h", 9999), addrs, succeeded=True)
+        wire_probe._record_outcome(("h", 9999), addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address(("h", 9999), addrs), addrs[0])
 
     def test_a_shrinking_answer_list_does_not_raise(self):
         # DNS can return fewer addresses than last cycle; a stale index would
         # be an IndexError inside collectd's read thread.
         addrs = [("A", "one"), ("B", "two"), ("C", "three")]
         for _ in range(wire_probe._ROTATE_AFTER_FAILURES * 2):
-            wire_probe._record_outcome("h", addrs, succeeded=False)
-        self.assertEqual(wire_probe._preferred_address("h", [("A", "one")]), ("A", "one"))
+            wire_probe._record_outcome(("h", 9999), addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address(("h", 9999), [("A", "one")]), ("A", "one"))
 
     def test_hosts_rotate_independently(self):
+        # One cycle is select-then-record, the order read_cb uses.
         addrs = [("A", "first"), ("B", "second")]
         for _ in range(wire_probe._ROTATE_AFTER_FAILURES):
-            wire_probe._record_outcome("h1", addrs, succeeded=False)
-        self.assertEqual(wire_probe._preferred_address("h1", addrs), addrs[1])
-        self.assertEqual(wire_probe._preferred_address("h2", addrs), addrs[0])
+            wire_probe._preferred_address(("h1", 9999), addrs)
+            wire_probe._record_outcome(("h1", 9999), addrs, succeeded=False)
+        self.assertEqual(wire_probe._preferred_address(("h1", 9999), addrs), addrs[1])
+        self.assertEqual(wire_probe._preferred_address(("h2", 9999), addrs), addrs[0])
+
+    def test_targets_that_render_to_the_same_label_keep_separate_state(self):
+        # Host "db_9999" on the global port and Host "db:9999" both display as
+        # "db_9999". Keying rotation state on the label let one target's
+        # failures move the other target's address.
+        addrs = [("A", "first"), ("B", "second")]
+        global_port = ("db_9999", 9999)
+        explicit = ("db", 9999)
+
+        for _ in range(wire_probe._ROTATE_AFTER_FAILURES):
+            wire_probe._preferred_address(global_port, addrs)
+            wire_probe._record_outcome(global_port, addrs, succeeded=False)
+
+        self.assertEqual(wire_probe._preferred_address(global_port, addrs), addrs[1])
+        self.assertEqual(
+            wire_probe._preferred_address(explicit, addrs),
+            addrs[0],
+            "the other target must not have been rotated",
+        )
+
+    def test_rotation_order_is_stable_under_a_shuffling_resolver(self):
+        # A resolver that reorders its answers must not make rotation
+        # oscillate between two entries and never reach the third.
+        a, b, c = ("A", "1"), ("A", "2"), ("A", "3")
+        key = ("h", 9999)
+        seen = set()
+        # Rotation fires once per run of failures, so reaching all three needs
+        # three runs.
+        for round_no in range(wire_probe._ROTATE_AFTER_FAILURES * 3 + 1):
+            addrs = [a, c, b] if round_no % 2 == 0 else [a, b, c]
+            seen.add(wire_probe._preferred_address(key, addrs))
+            wire_probe._record_outcome(key, addrs, succeeded=False)
+        self.assertEqual(seen, {a, b, c}, f"never reached every address: {seen}")
 
 
 class TestConfig(unittest.TestCase):
@@ -254,6 +289,48 @@ class TestConfig(unittest.TestCase):
         )
         self.assertEqual(len(wire_probe._hosts), 2)
         self.assertTrue(any("duplicate" in w for w in WARNINGS))
+
+    def test_colliding_series_labels_are_reported(self):
+        # Host "db_9999" on the global port and Host "db:9999" both dispatch as
+        # type_instance "db_9999", so collectd interleaves them into one
+        # series. Renaming either would break existing dashboards, so the
+        # plugin says so at startup instead of choosing for the operator.
+        wire_probe._hosts.clear()
+        WARNINGS.clear()
+        wire_probe.config_cb(Conf([Node("Host", ["db_9999"]), Node("Host", ["db:9999"])]))
+        wire_probe.init_cb()
+        self.assertTrue(
+            any("both report as" in w for w in WARNINGS),
+            f"collision went unreported: {WARNINGS}",
+        )
+
+    def test_distinct_targets_do_not_warn(self):
+        wire_probe._hosts.clear()
+        WARNINGS.clear()
+        wire_probe.config_cb(Conf([Node("Host", ["db"]), Node("Host", ["app:9999"])]))
+        wire_probe.init_cb()
+        self.assertFalse([w for w in WARNINGS if "both report as" in w], WARNINGS)
+
+    def test_non_numeric_values_warn_instead_of_raising(self):
+        # An out-of-range value already warned and fell back; a non-numeric one
+        # raised straight out of config_cb, aborting the block and leaving the
+        # plugin half-configured. A typo deserves the same treatment as a bad
+        # number.
+        for key, bad in (("Port", "abc"), ("Timeout", "oops"), ("PingCount", "many")):
+            with self.subTest(key=key):
+                WARNINGS.clear()
+                wire_probe.config_cb(Conf([Node(key, [bad])]))
+                self.assertTrue(
+                    any(key in w and "not a number" in w for w in WARNINGS),
+                    f"no warning for {key}={bad!r}: {WARNINGS}",
+                )
+
+    def test_a_bad_value_does_not_discard_the_rest_of_the_block(self):
+        wire_probe._hosts.clear()
+        wire_probe.config_cb(
+            Conf([Node("Port", ["abc"]), Node("Host", ["kept"])])
+        )
+        self.assertEqual([h[1] for h in wire_probe._hosts], ["kept"])
 
     def test_multiple_module_blocks_union(self):
         # collectd calls config_cb once per <Module> block; clearing the list

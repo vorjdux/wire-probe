@@ -45,15 +45,21 @@ fn run_probe(
     // Resolve outside the timed section: a per-tick getaddrinfo is a blocking
     // syscall that would corrupt cadence on a slow resolver, and folding it
     // into the measurement reports DNS as RTT.
-    let mut addrs = resolve(target).unwrap_or_else(|e| {
+    let resolved = resolve(target).unwrap_or_else(|e| {
         eprintln!("error: cannot resolve '{target}': {e}");
         std::process::exit(1);
     });
-    // Index into `addrs`. Exactly one address is probed per cycle, so the
-    // reported RTT keeps meaning "handshake with this endpoint"; rotating only
-    // on failure is what makes an unreachable first answer (commonly an AAAA
-    // ahead of a working A) recoverable.
-    let mut addr_idx: usize = 0;
+    let Some((mut addrs, preferred)) = adopt(resolved) else {
+        eprintln!("error: no address found for '{target}'");
+        std::process::exit(1);
+    };
+    // The address being probed, held by value rather than as an index: an
+    // index would silently point at a different endpoint the moment the
+    // resolver reorders its answers. Exactly one address is probed per cycle,
+    // so the reported RTT keeps meaning "handshake with this endpoint";
+    // rotating only on failure is what makes an unreachable first answer
+    // (commonly an AAAA ahead of a working A) recoverable.
+    let mut current = preferred;
 
     let host = hostname();
     // Round to nearest whole second; collectd PUTVAL interval= is integer seconds.
@@ -106,24 +112,7 @@ fn run_probe(
             .unwrap_or(Duration::ZERO)
             .as_nanos() as u64;
 
-        // get() rather than indexing: this is the hot loop of a process built
-        // with panic = "abort", so an index that ever went stale would kill
-        // the agent outright. The invariant is maintained by apply_resolution;
-        // this is the belt.
-        let addr = if let Some(&a) = addrs.get(addr_idx) {
-            a
-        } else {
-            // Reset and fall through to the first entry rather than
-            // `continue`: skipping to the next iteration would skip the sleep
-            // too, turning a broken invariant into a hot spin.
-            eprintln!("warning: address index went stale, resetting");
-            addr_idx = 0;
-            let Some(&first) = addrs.first() else {
-                eprintln!("error: no addresses left for '{target}'");
-                return;
-            };
-            first
-        };
+        let addr = current;
         let sent = match probe::measure_rtt(&addr, timeout) {
             Ok(rtt_ms) => {
                 failures_until_reresolve = RERESOLVE_AFTER_FAILURES;
@@ -137,7 +126,7 @@ fn run_probe(
                 failures_until_reresolve = failures_until_reresolve.saturating_sub(1);
                 if failures_until_reresolve == 0 {
                     failures_until_reresolve = RERESOLVE_AFTER_FAILURES;
-                    rotate_target(target, &mut addrs, &mut addr_idx);
+                    rotate_target(target, &mut addrs, &mut current);
                 }
                 exp.send_failure(ts_ns)
             }
@@ -192,19 +181,21 @@ fn run_probe(
 /// stretches one cycle in five. Acceptable because by the time it fires the
 /// target is already failing and cadence is already bounded by --timeout, not
 /// because it is free.
-fn rotate_target(target: &str, addrs: &mut Vec<std::net::SocketAddr>, addr_idx: &mut usize) {
+fn rotate_target(
+    target: &str,
+    addrs: &mut Vec<std::net::SocketAddr>,
+    current: &mut std::net::SocketAddr,
+) {
     match resolve(target) {
-        Ok(fresh) => match apply_resolution(addrs, addr_idx, fresh) {
-            Rotation::Unchanged => {}
-            Rotation::NextAddress => {
-                if let Some(addr) = addrs.get(*addr_idx) {
-                    eprintln!("info: trying the next address for '{target}': {addr}");
-                }
-            }
-            Rotation::Replaced => {
+        Ok(fresh) => {
+            let outcome = apply_resolution(addrs, current, fresh);
+            if outcome.list_changed {
                 eprintln!("info: '{target}' now resolves to {}", join_addrs(addrs));
             }
-        },
+            if outcome.moved {
+                eprintln!("info: trying the next address for '{target}': {current}");
+            }
+        }
         Err(e) => eprintln!("warning: re-resolving '{target}' failed: {e}"),
     }
 }
@@ -215,13 +206,12 @@ const RERESOLVE_AFTER_FAILURES: u32 = 5;
 /// What a re-resolution did, so the caller can log it and tests can assert it
 /// without needing DNS.
 #[derive(Debug, PartialEq, Eq)]
-enum Rotation {
-    /// One address, unchanged: nothing to move to.
-    Unchanged,
-    /// Same answers, so advance to the next entry in the list.
-    NextAddress,
-    /// The answers changed; the list was replaced and the index reset.
-    Replaced,
+struct Rotation {
+    /// The probe is now aimed at a different address than before.
+    moved: bool,
+    /// The set of answers differs from the previous one. Reordering alone
+    /// does not count: resolvers shuffle their answers routinely.
+    list_changed: bool,
 }
 
 /// Decides what to do with a fresh resolution. Pure, so the rotation policy is
@@ -229,24 +219,57 @@ enum Rotation {
 /// arranged from a test.
 fn apply_resolution(
     addrs: &mut Vec<std::net::SocketAddr>,
-    addr_idx: &mut usize,
+    current: &mut std::net::SocketAddr,
     fresh: Vec<std::net::SocketAddr>,
 ) -> Rotation {
-    if fresh != *addrs {
-        *addrs = fresh;
-        *addr_idx = 0;
-        return Rotation::Replaced;
+    let Some((sorted, preferred)) = adopt(fresh) else {
+        return Rotation {
+            moved: false,
+            list_changed: false,
+        };
+    };
+
+    // Compared as a set, not a sequence. A resolver that round-robins the same
+    // answers returns a "different" Vec every time; keying off that reset the
+    // selection to the front and put the probe back on the address that had
+    // just failed, for another full run of failures.
+    let list_changed = sorted != *addrs;
+    *addrs = sorted;
+
+    // Rotation walks the canonical order, so a shuffling resolver cannot make
+    // it oscillate between two entries and never reach the third. The
+    // selection is carried by address rather than by index, which would mean a
+    // different endpoint the moment the answers are reordered.
+    // The address in use may be gone from the answers. Then take the
+    // resolver's preferred one rather than the lowest-sorted: order carries
+    // the resolver's own preference (RFC 6724), and only rotation needs a
+    // stable sequence.
+    let next = addrs
+        .iter()
+        .position(|a| a == current)
+        .and_then(|pos| addrs.get(pos.saturating_add(1)).or_else(|| addrs.first()))
+        .copied()
+        .unwrap_or(preferred);
+    let moved = next != *current;
+    *current = next;
+
+    Rotation {
+        moved,
+        list_changed,
     }
-    if addrs.len() <= 1 {
-        return Rotation::Unchanged;
-    }
-    // Wrap without `%`: the modulo would be a division clippy cannot prove is
-    // non-zero, and this reads the same.
-    *addr_idx = addr_idx.saturating_add(1);
-    if *addr_idx >= addrs.len() {
-        *addr_idx = 0;
-    }
-    Rotation::NextAddress
+}
+
+/// Splits a resolver answer into the canonical order used for rotation and the
+/// resolver's own first choice. Duplicates are dropped: getaddrinfo can repeat
+/// an address, and a repeat would waste a rotation step on the same endpoint.
+fn adopt(
+    fresh: Vec<std::net::SocketAddr>,
+) -> Option<(Vec<std::net::SocketAddr>, std::net::SocketAddr)> {
+    let preferred = *fresh.first()?;
+    let mut sorted = fresh;
+    sorted.sort_unstable();
+    sorted.dedup();
+    Some((sorted, preferred))
 }
 
 /// Resolves every address the target currently answers with, in resolver
@@ -307,44 +330,92 @@ mod tests {
     #[test]
     fn a_single_address_has_nowhere_to_rotate() {
         let mut addrs = vec![addr("10.0.0.1:9999")];
-        let mut idx = 0;
+        let mut current = addrs[0];
         let same = addrs.clone();
-        let r = apply_resolution(&mut addrs, &mut idx, same);
-        assert_eq!(r, Rotation::Unchanged);
-        assert_eq!(idx, 0);
+        let r = apply_resolution(&mut addrs, &mut current, same);
+        assert_eq!(
+            r,
+            Rotation {
+                moved: false,
+                list_changed: false
+            }
+        );
+        assert_eq!(current, addr("10.0.0.1:9999"));
     }
 
     #[test]
     fn an_unreachable_first_answer_is_skipped_on_the_next_round() {
         // The case this exists for: DNS keeps returning an AAAA that never
-        // connects, ahead of an A that does. Without rotation the probe stays
-        // pinned to the dead one forever.
+        // connects, ahead of an A that does.
         let mut addrs = vec![addr("[::1]:9999"), addr("10.0.0.1:9999")];
-        let mut idx = 0;
-
+        let mut current = addrs[0];
         let same = addrs.clone();
-        assert_eq!(
-            apply_resolution(&mut addrs, &mut idx, same.clone()),
-            Rotation::NextAddress
-        );
-        assert_eq!(addrs[idx], addr("10.0.0.1:9999"));
+
+        assert!(apply_resolution(&mut addrs, &mut current, same.clone()).moved);
+        assert_eq!(current, addr("10.0.0.1:9999"));
 
         // And it wraps back rather than running off the end.
-        assert_eq!(
-            apply_resolution(&mut addrs, &mut idx, same),
-            Rotation::NextAddress
-        );
-        assert_eq!(addrs[idx], addr("[::1]:9999"));
+        assert!(apply_resolution(&mut addrs, &mut current, same).moved);
+        assert_eq!(current, addr("[::1]:9999"));
     }
 
     #[test]
-    fn changed_answers_replace_the_list_and_reset_the_index() {
+    fn a_reordered_answer_is_not_treated_as_a_new_list() {
+        // A round-robin resolver returns the same addresses in a different
+        // order every time. Comparing sequences made that look like a fresh
+        // answer, which reset the selection to the front and put the probe
+        // back on the address that had just failed, forever.
         let mut addrs = vec![addr("10.0.0.1:9999"), addr("10.0.0.2:9999")];
-        let mut idx = 1;
-        let r = apply_resolution(&mut addrs, &mut idx, vec![addr("10.0.0.9:9999")]);
-        assert_eq!(r, Rotation::Replaced);
+        let mut current = addrs[0];
+        let reordered = vec![addr("10.0.0.2:9999"), addr("10.0.0.1:9999")];
+
+        let r = apply_resolution(&mut addrs, &mut current, reordered);
+        assert!(!r.list_changed, "reordering is not a change of answers");
+        assert!(r.moved);
+        assert_eq!(current, addr("10.0.0.2:9999"), "must advance, not reset");
+    }
+
+    #[test]
+    fn a_shuffling_tail_still_makes_progress() {
+        // The audit's case: the dead address stays first while the tail
+        // reorders. Cycling back to it every third round is correct  -  nothing
+        // here knows which address is dead. What must not happen is landing on
+        // it every single round, which is what comparing sequences did.
+        let bad = addr("10.0.0.1:9999");
+        let mut addrs = vec![bad, addr("10.0.0.2:9999"), addr("10.0.0.3:9999")];
+        let mut current = bad;
+
+        let mut visited = Vec::new();
+        for round in 0..6 {
+            let shuffled = if round % 2 == 0 {
+                vec![bad, addr("10.0.0.3:9999"), addr("10.0.0.2:9999")]
+            } else {
+                vec![bad, addr("10.0.0.2:9999"), addr("10.0.0.3:9999")]
+            };
+            apply_resolution(&mut addrs, &mut current, shuffled);
+            visited.push(current);
+        }
+
+        let stuck = visited.iter().filter(|&&a| a == bad).count();
+        assert!(stuck <= 2, "spent {stuck} of 6 rounds on the dead address");
+        assert!(
+            visited.contains(&addr("10.0.0.2:9999")) && visited.contains(&addr("10.0.0.3:9999")),
+            "never reached the working addresses: {visited:?}"
+        );
+    }
+
+    #[test]
+    fn changed_answers_keep_progressing_from_the_current_address() {
+        let mut addrs = vec![addr("10.0.0.1:9999"), addr("10.0.0.2:9999")];
+        let mut current = addrs[1];
+        let r = apply_resolution(&mut addrs, &mut current, vec![addr("10.0.0.9:9999")]);
+        assert!(r.list_changed);
         assert_eq!(addrs, vec![addr("10.0.0.9:9999")]);
-        assert_eq!(idx, 0, "a stale index would panic on the shorter list");
+        assert_eq!(
+            current,
+            addr("10.0.0.9:9999"),
+            "an address that vanished cannot stay selected"
+        );
     }
 
     #[test]

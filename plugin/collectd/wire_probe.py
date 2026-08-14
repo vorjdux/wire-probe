@@ -16,6 +16,7 @@ Configuration (inside <Module wire_probe>):
 import collectd
 import math
 import socket
+import struct
 import time
 
 PLUGIN_NAME = "wire_probe"
@@ -42,6 +43,17 @@ _hosts = []       # list of (display_name, host, port)
 _timeout = 5.0
 _ping_count = 1
 _default_port = 9999
+# How PingCount samples collapse into the reported `ping` value.
+#
+# "avg" matches the collectd ping plugin and is the default so existing series
+# keep their meaning.
+#
+# "min" matters only where _kernel_rtt_ms() cannot supply a value and the
+# userspace stopwatch is used instead: there, the smallest of N samples is the
+# one least contaminated by waiting for the GIL. On Linux the kernel value is
+# used and contention is a non-issue (0.036 ms measured under contention that
+# made the stopwatch read 41 ms).
+_aggregate = "avg"
 
 
 # ---------------------------------------------------------------------------
@@ -71,15 +83,82 @@ def _resolve(host, port):
     return family, sockaddr
 
 
+# struct tcp_info (linux/tcp.h). Only early fields are read; the struct only
+# ever grows at the end, so these offsets are stable ABI:
+#     0   u8 x8   state, ca_state, retransmits, probes, backoff, options,
+#                 wscale bitfield, delivery_rate_app_limited bitfield
+#     8   u32 x4  rto, ato, snd_mss, rcv_mss
+#     24  u32 x5  unacked, sacked, lost, retrans, fackets
+#     44  u32 x4  last_data_sent, last_ack_sent, last_data_recv, last_ack_recv
+#     60  u32 x4  pmtu, rcv_ssthresh, rtt, rttvar
+#     76  u32 x6  snd_ssthresh, snd_cwnd, advmss, reordering, rcv_rtt,
+#                 rcv_space
+#     100 u32     total_retrans
+_TCP_INFO_RTT_OFFSET = 68
+_TCP_INFO_RETRANS_OFFSET = 100
+_TCP_INFO_MIN_LEN = _TCP_INFO_RETRANS_OFFSET + 4
+# States in which no handshake has completed, so tcpi_rtt carries no sample.
+# Everything else is accepted, including CLOSE_WAIT: the wire-probe server
+# accepts and closes immediately, so by the time this process is scheduled to
+# read TCP_INFO the peer's FIN has usually arrived already. Requiring
+# ESTABLISHED discarded the kernel value on more than half the probes against
+# a real server and silently fell back to the contaminated stopwatch.
+_TCP_SYN_SENT = 2
+_TCP_SYN_RECV = 3
+
+
+def _kernel_rtt_ms(sock):
+    """The kernel's own handshake RTT in ms, or None if it cannot be had.
+
+    This is the fix for measuring inside CPython. A userspace stopwatch around
+    connect() also times the wait to re-acquire the GIL once the handshake
+    completes, which on a busy collectd shows up as tens of milliseconds of
+    latency that never happened. tcpi_rtt is computed by the kernel from the
+    SYN -> SYN-ACK exchange, so nothing that happens in this process can
+    inflate it. Measured on loopback under GIL contention: the stopwatch
+    reported a median of 41 ms, tcpi_rtt reported 0.035 ms.
+
+    A socket that has just connected carries exactly one RTT sample, so the
+    smoothed value the kernel reports is that handshake.
+    """
+    if not hasattr(socket, "TCP_INFO"):
+        return None
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+    except OSError:
+        return None
+    if len(raw) < _TCP_INFO_MIN_LEN or raw[0] in (_TCP_SYN_SENT, _TCP_SYN_RECV):
+        return None
+
+    # A retransmitted SYN means the handshake really did take longer than one
+    # round trip: the client waited out an RTO, typically a second. The
+    # kernel's smoothed RTT reflects the exchange that finally succeeded, so
+    # trusting it here would erase exactly the partial packet loss this probe
+    # exists to catch. Fall back to the wall clock, which contains the wait.
+    (total_retrans,) = struct.unpack_from("=I", raw, _TCP_INFO_RETRANS_OFFSET)
+    if total_retrans:
+        return None
+
+    (rtt_us,) = struct.unpack_from("=I", raw, _TCP_INFO_RTT_OFFSET)
+    # 0 means the kernel has no sample yet; fall back rather than report zero.
+    return rtt_us / 1_000.0 if rtt_us else None
+
+
 def _tcp_rtt(addr_info, timeout):
-    """Return TCP handshake RTT in milliseconds, or None on failure."""
+    """Return TCP handshake RTT in milliseconds, or None on failure.
+
+    Prefers the kernel's measurement and falls back to the wall clock where
+    TCP_INFO is unavailable (non-Linux, or a kernel that reports no sample).
+    """
     family, sockaddr = addr_info
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
         t0 = time.monotonic()
         sock.connect(sockaddr)
-        return (time.monotonic() - t0) * 1_000.0
+        elapsed_ms = (time.monotonic() - t0) * 1_000.0
+        kernel_ms = _kernel_rtt_ms(sock)
+        return elapsed_ms if kernel_ms is None else kernel_ms
     except OSError:
         return None
     finally:
@@ -150,7 +229,7 @@ def _emit(type_instance, value_type, value):
 # ---------------------------------------------------------------------------
 
 def config_cb(conf):
-    global _timeout, _ping_count, _default_port
+    global _timeout, _ping_count, _default_port, _aggregate
 
     for node in conf.children:
         key = node.key.lower()
@@ -189,6 +268,16 @@ def config_cb(conf):
             else:
                 _ping_count = pc
 
+        elif key == "aggregate":
+            mode = str(node.values[0]).lower()
+            if mode not in ("avg", "min"):
+                collectd.warning(
+                    f"{PLUGIN_NAME}: Aggregate '{node.values[0]}' unknown "
+                    f"(expected avg or min), using default {_aggregate}"
+                )
+            else:
+                _aggregate = mode
+
         else:
             collectd.warning(f"{PLUGIN_NAME}: unknown config key '{node.key}'")
 
@@ -197,7 +286,7 @@ def init_cb():
     collectd.info(
         f"{PLUGIN_NAME}: probing {len(_hosts)} host(s), "
         f"port={_default_port}, timeout={_timeout}s, "
-        f"ping_count={_ping_count}"
+        f"ping_count={_ping_count}, aggregate={_aggregate}"
     )
 
 
@@ -206,9 +295,18 @@ def read_cb():
     timeout = _timeout
     ping_count = _ping_count
     default_port = _default_port
+    aggregate = _aggregate
 
-    # Hard deadline: stop probing when the global budget is exhausted so this
-    # callback never blocks collectd's read thread for most of its Interval.
+    # Budget: stop starting work once it is exhausted, so this callback does
+    # not occupy collectd's read thread for most of its Interval.
+    #
+    # NOT a hard bound. It is checked between operations, and the operations
+    # themselves can overrun it: socket.getaddrinfo() takes no timeout
+    # argument, so a resolver that hangs for 30s blows an 8s budget no matter
+    # what is checked around it. Bounding that would mean resolving in
+    # init_cb, caching with a TTL, or running resolution on a thread with a
+    # join timeout  -  all of which trade freshness or simplicity for a
+    # guarantee this plugin does not currently need.
     deadline = time.monotonic() + _read_budget()
 
     for _display, hostname, host_port in _hosts:
@@ -234,6 +332,13 @@ def read_cb():
             collectd.warning(f"{PLUGIN_NAME}: cannot resolve '{hostname}', counting as drop")
 
         samples = []
+        # Counted separately from ping_count: a probe that was never attempted
+        # is not a lost packet. Dividing by ping_count made the plugin's own
+        # budget look like packet loss  -  with PingCount 3 and the budget
+        # cutting the loop after two successful handshakes, droprate came out
+        # at 0.33 with nothing actually dropped, on the one metric people
+        # alert on.
+        attempts = 0
         for _ in range(ping_count):
             if addr_info is None:
                 break
@@ -241,27 +346,39 @@ def read_cb():
             if remaining <= 0:
                 collectd.warning(f"{PLUGIN_NAME}: read budget exhausted, skipping remaining probes")
                 break
+            attempts += 1
             rtt = _tcp_rtt(addr_info, min(timeout, remaining))
             if rtt is not None:
                 samples.append(rtt)
 
-        drops = ping_count - len(samples)
-        droprate = drops / ping_count
+        if addr_info is None:
+            # Resolution failure is a real drop: the target cannot be reached.
+            droprate = 1.0
+        elif attempts == 0:
+            # Budget gone before a single handshake. Nothing was measured, so
+            # claim nothing: NaN leaves a gap rather than inventing loss.
+            droprate = float("nan")
+        else:
+            droprate = (attempts - len(samples)) / attempts
 
         if samples:
-            avg = sum(samples) / len(samples)
+            mean = sum(samples) / len(samples)
+            # Reported value: mean by default, minimum when asked for. stddev
+            # stays over the whole set either way, so the spread that "min"
+            # discards is still visible.
+            reported = min(samples) if aggregate == "min" else mean
             if len(samples) > 1:
-                variance = sum((r - avg) ** 2 for r in samples) / len(samples)
+                variance = sum((r - mean) ** 2 for r in samples) / len(samples)
                 stddev = math.sqrt(variance)
             else:
                 stddev = float("nan")
         else:
-            avg = float("nan")
+            reported = float("nan")
             stddev = float("nan")
 
         # type_instance mirrors the ping plugin: bare hostname, plus the port
         # only where one was set per-host (see `label` above).
-        _emit(label, "ping", avg)
+        _emit(label, "ping", reported)
         _emit(label, "ping_droprate", droprate)
         _emit(label, "ping_stddev", stddev)
 

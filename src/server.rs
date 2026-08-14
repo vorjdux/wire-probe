@@ -65,7 +65,10 @@ fn run_blocking(listener: &TcpListener) -> std::io::Result<()> {
     loop {
         match listener.accept() {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // No WouldBlock arm: this listener comes from bind() and is
+            // blocking, so accept never returns EAGAIN. An empty arm here
+            // would hot-spin without backoff if that ever stopped holding,
+            // which is the exact failure the branch below exists to prevent.
             Err(e) => {
                 // Same reasoning as the io_uring path: back off so a sustained
                 // failure (EMFILE) neither hot-spins nor floods stderr.
@@ -83,7 +86,17 @@ fn run_io_uring(listener: &TcpListener, mut ring: IoUring) -> std::io::Result<()
     ring.submit()?;
 
     loop {
-        ring.submit_and_wait(1)?;
+        // io_uring_enter returns EINTR whenever a signal is delivered while it
+        // waits, even for signals whose default action is not to terminate.
+        // SIGCONT after a cgroup freeze (Kubernetes eviction, checkpointing,
+        // `systemctl freeze`, a debugger detaching) is enough. Propagating that
+        // killed the server; the blocking fallback survived the same signal,
+        // so the two paths did not agree on what is fatal.
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
 
         let mut rearm = false;
         {
@@ -142,6 +155,8 @@ fn push_accept(ring: &mut IoUring, fd: i32) -> std::io::Result<()> {
     // nothing must outlive this call for the kernel to read.
     unsafe {
         ring.submission()
+            // Nothing is discarded by the wildcard: io_uring's PushError
+            // carries no payload, it only means the submission queue is full.
             .push(&sqe)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "SQ full"))?;
     }

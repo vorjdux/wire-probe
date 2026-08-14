@@ -244,6 +244,39 @@ LoadPlugin python
 </Plugin>
 ```
 
+> **Accuracy on a busy host.** Both the plugin and the Rust probe read the
+> handshake RTT from the kernel (`TCP_INFO.tcpi_rtt`, computed from the
+> SYN → SYN-ACK exchange) rather than timing `connect()` in userspace. A
+> stopwatch around `connect()` also times getting the process scheduled again
+> once the handshake completes  -  inside CPython that means waiting for the
+> GIL, and it lands in the value as latency the network never saw.
+>
+> Measured on loopback, where the true RTT is ~0.005 ms:
+>
+> | | p50 | p99 | max |
+> |---|---|---|---|
+> | userspace stopwatch, GIL contention | 41 ms | 461 ms | 918 ms |
+> | kernel `tcpi_rtt`, same contention | **0.036 ms** | **0.067 ms** | 0.15 ms |
+> | Rust probe, every core saturated | 0.038 ms | 0.064 ms | 0.07 ms |
+>
+> The kernel value is used whenever it is available, with the wall clock as a
+> fallback: non-Linux, a socket with no sample yet, or a handshake whose SYN
+> was retransmitted. That last case matters  -  the kernel's smoothed RTT
+> reflects the exchange that finally succeeded, so on partial packet loss it
+> would report ~1 ms for a connect that really waited out a second-long RTO,
+> hiding exactly what this probe exists to catch. `tcpi_total_retrans` is
+> checked and the wall clock wins there. Verified with `tc qdisc add dev lo
+> root netem loss 25%`: a clean loopback reported p50 0.035 ms, and under loss
+> the same probe reported p50 1023 ms with a maximum of 2054 ms  -  one and two
+> SYN retransmission timeouts, exactly the wait the kernel value would have
+> hidden. `Aggregate "min"`
+> exists for that fallback path, where the minimum of `PingCount` samples is
+> the one least contaminated by scheduling.
+>
+> The server side was never implicated: 500 concurrent handshakes against it
+> measured p99 0.37 ms with no failures, no worse than a plain listener with a
+> backlog of 128.
+
 `LoadPlugin python` is only needed if the python plugin is not already loaded
 elsewhere in `collectd.conf`  -  drop that line if it is, to avoid a duplicate
 `LoadPlugin` warning at startup.

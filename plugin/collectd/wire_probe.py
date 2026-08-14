@@ -16,6 +16,7 @@ Configuration (inside <Module wire_probe>):
 import collectd
 import math
 import socket
+import struct
 import time
 
 PLUGIN_NAME = "wire_probe"
@@ -45,19 +46,13 @@ _default_port = 9999
 # How PingCount samples collapse into the reported `ping` value.
 #
 # "avg" matches the collectd ping plugin and is the default so existing series
-# keep their meaning. "min" exists because this plugin runs inside CPython:
-# the measurement is monotonic() around connect(), so any delay in re-acquiring
-# the GIL after connect() returns lands in the value as if it were network
-# latency. Measured on loopback, where the true RTT is 0.007 ms:
+# keep their meaning.
 #
-#   idle                        p50 0.007 ms   p99 0.032 ms
-#   with GIL contention         p50 41 ms      p99 461 ms
-#
-# With PingCount 3 under that contention, avg reported p50 27 ms while min
-# reported p50 5 ms. The minimum of N samples is the one least contaminated by
-# scheduling, so "min" is the better estimator of the actual handshake on a
-# busy collectd host. It cannot help at PingCount 1, where there is nothing to
-# choose between.
+# "min" matters only where _kernel_rtt_ms() cannot supply a value and the
+# userspace stopwatch is used instead: there, the smallest of N samples is the
+# one least contaminated by waiting for the GIL. On Linux the kernel value is
+# used and contention is a non-issue (0.036 ms measured under contention that
+# made the stopwatch read 41 ms).
 _aggregate = "avg"
 
 
@@ -88,15 +83,68 @@ def _resolve(host, port):
     return family, sockaddr
 
 
+# struct tcp_info (linux/tcp.h). Only early fields are read; the struct only
+# ever grows at the end, so these offsets are stable ABI:
+#     0   u8 x8   state, ca_state, retransmits, probes, backoff, options,
+#                 wscale bitfield, delivery_rate_app_limited bitfield
+#     8   u32 x4  rto, ato, snd_mss, rcv_mss
+#     24  u32 x5  unacked, sacked, lost, retrans, fackets
+#     44  u32 x4  last_data_sent, last_ack_sent, last_data_recv, last_ack_recv
+#     60  u32 x4  pmtu, rcv_ssthresh, rtt, rttvar
+_TCP_INFO_RTT_OFFSET = 68
+_TCP_INFO_MIN_LEN = _TCP_INFO_RTT_OFFSET + 4
+# States in which no handshake has completed, so tcpi_rtt carries no sample.
+# Everything else is accepted, including CLOSE_WAIT: the wire-probe server
+# accepts and closes immediately, so by the time this process is scheduled to
+# read TCP_INFO the peer's FIN has usually arrived already. Requiring
+# ESTABLISHED discarded the kernel value on more than half the probes against
+# a real server and silently fell back to the contaminated stopwatch.
+_TCP_SYN_SENT = 2
+_TCP_SYN_RECV = 3
+
+
+def _kernel_rtt_ms(sock):
+    """The kernel's own handshake RTT in ms, or None if it cannot be had.
+
+    This is the fix for measuring inside CPython. A userspace stopwatch around
+    connect() also times the wait to re-acquire the GIL once the handshake
+    completes, which on a busy collectd shows up as tens of milliseconds of
+    latency that never happened. tcpi_rtt is computed by the kernel from the
+    SYN -> SYN-ACK exchange, so nothing that happens in this process can
+    inflate it. Measured on loopback under GIL contention: the stopwatch
+    reported a median of 41 ms, tcpi_rtt reported 0.035 ms.
+
+    A socket that has just connected carries exactly one RTT sample, so the
+    smoothed value the kernel reports is that handshake.
+    """
+    if not hasattr(socket, "TCP_INFO"):
+        return None
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+    except OSError:
+        return None
+    if len(raw) < _TCP_INFO_MIN_LEN or raw[0] in (_TCP_SYN_SENT, _TCP_SYN_RECV):
+        return None
+    (rtt_us,) = struct.unpack_from("=I", raw, _TCP_INFO_RTT_OFFSET)
+    # 0 means the kernel has no sample yet; fall back rather than report zero.
+    return rtt_us / 1_000.0 if rtt_us else None
+
+
 def _tcp_rtt(addr_info, timeout):
-    """Return TCP handshake RTT in milliseconds, or None on failure."""
+    """Return TCP handshake RTT in milliseconds, or None on failure.
+
+    Prefers the kernel's measurement and falls back to the wall clock where
+    TCP_INFO is unavailable (non-Linux, or a kernel that reports no sample).
+    """
     family, sockaddr = addr_info
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
         t0 = time.monotonic()
         sock.connect(sockaddr)
-        return (time.monotonic() - t0) * 1_000.0
+        elapsed_ms = (time.monotonic() - t0) * 1_000.0
+        kernel_ms = _kernel_rtt_ms(sock)
+        return elapsed_ms if kernel_ms is None else kernel_ms
     except OSError:
         return None
     finally:

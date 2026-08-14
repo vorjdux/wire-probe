@@ -244,22 +244,29 @@ LoadPlugin python
 </Plugin>
 ```
 
-> **Accuracy on a busy host.** The plugin measures `monotonic()` around
-> `connect()` inside CPython, so time spent waiting to re-acquire the GIL after
-> the handshake completes is reported as if it were network latency. Measured
-> on loopback, where the true RTT is 0.007 ms:
+> **Accuracy on a busy host.** Both the plugin and the Rust probe read the
+> handshake RTT from the kernel (`TCP_INFO.tcpi_rtt`, computed from the
+> SYN → SYN-ACK exchange) rather than timing `connect()` in userspace. A
+> stopwatch around `connect()` also times getting the process scheduled again
+> once the handshake completes  -  inside CPython that means waiting for the
+> GIL, and it lands in the value as latency the network never saw.
 >
-> | | p50 | p99 |
-> |---|---|---|
-> | idle | 0.007 ms | 0.032 ms |
-> | under GIL contention | 41 ms | 461 ms |
-> | Rust probe, every core saturated | 0.14 ms | 13 ms |
+> Measured on loopback, where the true RTT is ~0.005 ms:
 >
-> If the scatter shows up in your dashboards, either set `PingCount 3` with
-> `Aggregate "min"` (which reported 5 ms where the mean reported 27 ms under
-> the same contention), or run the Rust binary via `--export collectd-exec`
-> or `collectd-uds://` instead. The server side is not implicated: 500
-> concurrent handshakes against it measured p99 0.37 ms with no failures.
+> | | p50 | p99 | max |
+> |---|---|---|---|
+> | userspace stopwatch, GIL contention | 41 ms | 461 ms | 918 ms |
+> | kernel `tcpi_rtt`, same contention | **0.036 ms** | **0.067 ms** | 0.15 ms |
+> | Rust probe, every core saturated | 0.038 ms | 0.064 ms | 0.07 ms |
+>
+> The kernel value is used whenever it is available, with the wall clock as a
+> fallback (non-Linux, or a socket with no sample yet). `Aggregate "min"`
+> exists for that fallback path, where the minimum of `PingCount` samples is
+> the one least contaminated by scheduling.
+>
+> The server side was never implicated: 500 concurrent handshakes against it
+> measured p99 0.37 ms with no failures, no worse than a plain listener with a
+> backlog of 128.
 
 `LoadPlugin python` is only needed if the python plugin is not already loaded
 elsewhere in `collectd.conf`  -  drop that line if it is, to avoid a duplicate

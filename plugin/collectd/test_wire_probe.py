@@ -106,6 +106,56 @@ class TestHostParsing(unittest.TestCase):
             self.assertIsNotNone(wire_probe._resolve(host, port or 9999), raw)
 
 
+class TestKernelRtt(unittest.TestCase):
+    """The kernel's tcpi_rtt is what makes the measurement GIL-proof."""
+
+    def setUp(self):
+        self.srv, self.port = listening_socket()
+
+    def tearDown(self):
+        self.srv.close()
+
+    def test_reports_a_plausible_handshake_rtt(self):
+        s = socket.socket()
+        s.connect(("127.0.0.1", self.port))
+        try:
+            rtt = wire_probe._kernel_rtt_ms(s)
+            self.assertIsNotNone(rtt, "TCP_INFO unavailable on this kernel")
+            self.assertGreater(rtt, 0.0)
+            self.assertLess(rtt, 50.0, "loopback handshake should be sub-ms")
+        finally:
+            s.close()
+
+    def test_survives_the_peer_closing_first(self):
+        # Regression guard. The wire-probe server accepts and closes at once,
+        # so the socket is usually in CLOSE_WAIT by the time this runs.
+        # Requiring ESTABLISHED discarded the kernel value on more than half
+        # the probes and silently fell back to the userspace stopwatch.
+        s = socket.socket()
+        s.connect(("127.0.0.1", self.port))
+        try:
+            time.sleep(0.05)  # let the server's FIN arrive
+            state = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)[0]
+            self.assertNotEqual(state, 1, "test did not reach CLOSE_WAIT")
+            self.assertIsNotNone(
+                wire_probe._kernel_rtt_ms(s),
+                f"kernel RTT rejected in TCP state {state}",
+            )
+        finally:
+            s.close()
+
+    def test_tcp_rtt_falls_back_when_the_kernel_value_is_missing(self):
+        real = wire_probe._kernel_rtt_ms
+        wire_probe._kernel_rtt_ms = lambda _s: None
+        try:
+            addr_info = wire_probe._resolve("127.0.0.1", self.port)
+            rtt = wire_probe._tcp_rtt(addr_info, 1.0)
+        finally:
+            wire_probe._kernel_rtt_ms = real
+        self.assertIsNotNone(rtt, "fallback path must still produce a value")
+        self.assertGreater(rtt, 0.0)
+
+
 class TestConfig(unittest.TestCase):
     def setUp(self):
         wire_probe._hosts.clear()

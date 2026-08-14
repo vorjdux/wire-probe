@@ -118,7 +118,18 @@ impl CollectdExporter {
                 match stream.write_all(&self.buf) {
                     Ok(()) => Ok(()),
                     Err(e) => {
-                        *stream = connect_uds(path)?;
+                        match connect_uds(path) {
+                            Ok(fresh) => *stream = fresh,
+                            Err(reconnect_err) => {
+                                // Report both. Propagating only the reconnect
+                                // error would show the operator "connection
+                                // refused" when the actual event was a failed
+                                // write; the stale stream stays in place and
+                                // the next send tries again.
+                                eprintln!("warn: write to {path} failed: {e}");
+                                return Err(reconnect_err);
+                            }
+                        }
                         Err(e)
                     }
                 }

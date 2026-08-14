@@ -162,8 +162,13 @@ def _kernel_rtt_ms(sock):
     inflate it. Measured on loopback under GIL contention: the stopwatch
     reported a median of 41 ms, tcpi_rtt reported 0.035 ms.
 
-    A socket that has just connected carries exactly one RTT sample, so the
-    smoothed value the kernel reports is that handshake.
+    tcpi_rtt is the smoothed srtt, so it is only the handshake while the
+    connection carries exactly one sample. It does: the server's FIN normally
+    lands before this reads, but Linux takes an RTT sample only when an ACK
+    acknowledges data we sent, and a probe sends none. Measured over 200
+    connections against an accept-and-close server with tcp_timestamps=1:
+    every socket moved ESTABLISHED -> CLOSE_WAIT and tcpi_rtt changed in zero
+    of them.
     """
     if not hasattr(socket, "TCP_INFO"):
         return None

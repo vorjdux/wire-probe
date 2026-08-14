@@ -9,11 +9,15 @@
 #   CONF_DIR=/etc/collectd/conf.d             override collectd config drop-in directory
 #   NO_RESTART=1                              skip 'systemctl restart collectd'
 #                                             (NO_RELOAD=1 also accepted)
+#   REF=v0.1.9                                install from a tag instead of main
 #   NO_COLOR=1                                disable coloured output
 set -e
 
 REPO="vorjdux/wire-probe"
-RAW_BASE="https://raw.githubusercontent.com/${REPO}/main/plugin/collectd"
+# Pin with REF=v0.1.9 to install the plugin from a tag rather than whatever is
+# on main. Tags are immutable, so this is what makes an install reproducible.
+REF="${REF:-main}"
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}/plugin/collectd"
 
 # ── Colour output ──────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -39,6 +43,7 @@ for arg in "$@"; do
       echo "Environment variables:"
       echo "  PLUGIN_DIR=/path    directory to install wire_probe.py"
       echo "  CONF_DIR=/path      collectd conf.d directory"
+      echo "  REF=v0.1.9          install from a tag instead of main"
       echo "  NO_RESTART=1        skip systemctl restart collectd"
       exit 0 ;;
   esac
@@ -61,11 +66,30 @@ info "  config: ${CONF_DIR}/wire_probe.conf  (skipped if already present)"
 [ "$(id -u)" -eq 0 ] || die "must be run as root (sudo) to write to ${PLUGIN_DIR} and ${CONF_DIR}"
 
 # ── Install plugin ─────────────────────────────────────────────────────────
+# Downloaded beside the target and renamed into place, never written over the
+# live file: a truncated download  -  interrupted, disk full, connection reset  -
+# would otherwise leave collectd importing half a module. The temp file lives
+# in PLUGIN_DIR so the rename stays within one filesystem and is atomic.
 mkdir -p "$PLUGIN_DIR"
+TMP_PLUGIN="${PLUGIN_DIR}/.wire_probe.py.$$"
+trap 'rm -f "$TMP_PLUGIN"' EXIT
+
 curl --proto '=https' --tlsv1.2 -sfL \
   "${RAW_BASE}/wire_probe.py" \
-  -o "${PLUGIN_DIR}/wire_probe.py" \
+  -o "$TMP_PLUGIN" \
   || die "failed to download wire_probe.py"
+
+# A syntax error would only surface as a collectd startup failure otherwise.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -m py_compile "$TMP_PLUGIN" \
+    || die "downloaded wire_probe.py does not compile  -  refusing to install"
+  rm -rf "${PLUGIN_DIR}/__pycache__"
+else
+  warn "python3 not found  -  skipping the syntax check"
+fi
+
+chmod 644 "$TMP_PLUGIN"
+mv "$TMP_PLUGIN" "${PLUGIN_DIR}/wire_probe.py"
 ok "installed ${PLUGIN_DIR}/wire_probe.py"
 
 # ── Install example config (only if absent) ────────────────────────────────

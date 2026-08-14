@@ -44,9 +44,50 @@ jobs:
             exit 1
           fi
 
+  # CI only runs on branch pushes and pull requests, so a tag push reached
+  # publish without a single test having run. The version gate stopped an
+  # incoherent version shipping; nothing stopped broken code shipping.
+  verify:
+    name: Tests and lints
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl-tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
+
+      # Counts asserted for the same reason as in ci.yml: a suite that stops
+      # being discovered exits 0 and would wave a release through.
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          cargo test --locked 2>&1 | tee cargo-test.log
+          grep -qE 'running [1-9][0-9]* tests?' cargo-test.log \
+            || { echo "::error::no Rust tests were discovered"; exit 1; }
+
+      - name: Collectd plugin tests
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s plugin/collectd -v 2>&1 | tee plugin-test.log
+          grep -qE '^Ran [1-9][0-9]* tests?' plugin-test.log \
+            || { echo "::error::no collectd plugin tests were discovered"; exit 1; }
+
   build-static:
     name: Static · ${{ matrix.arch }}
-    needs: check-version
+    needs: [check-version, verify]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -95,7 +136,7 @@ jobs:
   # Native glibc builds  -  distro-specific tarballs
   # ──────────────────────────────────────────────────────────────────────────
   build-distro:
-    needs: check-version
+    needs: [check-version, verify]
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}

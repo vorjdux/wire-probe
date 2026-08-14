@@ -148,7 +148,16 @@ EXTRACTED=$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)
 # umask 077 produced a 0700 binary in /usr/local/bin that no service user  -
 # including the DynamicUser in the systemd unit  -  could execute.
 chmod 755 "$EXTRACTED"
-mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
+
+# Staged inside INSTALL_DIR before the rename. Moving straight from TMP_DIR
+# crosses filesystems whenever /tmp is its own mount, and mv then degrades to
+# copy-then-unlink: an interruption there leaves a truncated binary where a
+# working one used to be. Within one directory the rename is atomic.
+STAGED="${INSTALL_DIR}/.${BINARY}.$$"
+trap 'rm -rf "$TMP_DIR" "$STAGED"' EXIT
+cp "$EXTRACTED" "$STAGED" || die "cannot write to ${INSTALL_DIR}"
+chmod 755 "$STAGED"
+mv "$STAGED" "${INSTALL_DIR}/${BINARY}"
 
 ok "installed ${INSTALL_DIR}/${BINARY}"
 

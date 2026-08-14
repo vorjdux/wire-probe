@@ -35,7 +35,7 @@ curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh |
 Or install a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh | VERSION=0.1.2 sh
+curl -sSf https://raw.githubusercontent.com/vorjdux/wire-probe/main/install.sh | VERSION=0.1.9 sh
 ```
 
 Pre-built tarballs for every platform are on the [releases page](https://github.com/vorjdux/wire-probe/releases/latest).

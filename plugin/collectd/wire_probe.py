@@ -54,10 +54,14 @@ _default_port = 9999
 # used and contention is a non-issue (0.036 ms measured under contention that
 # made the stopwatch read 41 ms).
 _aggregate = "avg"
-# Per-label index into the resolved address list, plus the run of consecutive
-# failures that drives rotation. Same policy as the Rust probe: stay on one
-# address while it works, and only move after a run of failures, so the
-# reported RTT keeps meaning "handshake with this endpoint".
+# Keyed by (hostname, port), never by the display label: two differently
+# configured targets can render to the same label  -  Host "db_9999" on the
+# global port and Host "db:9999" both read "db_9999"  -  and sharing rotation
+# state between them would let one target's failures move the other's address.
+#
+# The value is (selected_address, consecutive_failures). The address is held
+# by identity rather than by index, because an index means a different
+# endpoint the moment the resolver reorders its answers.
 _addr_state = {}
 _ROTATE_AFTER_FAILURES = 5
 
@@ -95,35 +99,52 @@ def _resolve(host, port):
     return addrs[0] if addrs else None
 
 
-def _preferred_address(label, addrs):
+def _rotation_order(addrs):
+    """Canonical order for rotation, independent of what the resolver returns.
+
+    A resolver that shuffles its answers would otherwise make rotation
+    oscillate between two entries and never reach a third.
+    """
+    return sorted(addrs, key=lambda a: (a[0], repr(a[1])))
+
+
+def _preferred_address(key, addrs):
     """Pick which resolved address to probe this cycle, or None."""
     if not addrs:
         return None
-    idx, failures = _addr_state.get(label, (0, 0))
-    if idx >= len(addrs):
-        # The list shrank since last cycle; a stale index would raise.
-        idx = 0
-    _addr_state[label] = (idx, failures)
-    return addrs[idx]
+    selected, failures = _addr_state.get(key, (None, 0))
+    if selected not in addrs:
+        # First cycle, or the address in use vanished from the answers. Take
+        # the resolver's own first choice: its order carries preference
+        # (RFC 6724), and only rotation needs a stable sequence.
+        selected = addrs[0]
+    _addr_state[key] = (selected, failures)
+    return selected
 
 
-def _record_outcome(label, addrs, succeeded):
+def _record_outcome(key, addrs, succeeded):
     """Advance to the next address after a run of failures."""
     if not addrs:
         return
-    idx, failures = _addr_state.get(label, (0, 0))
+    selected, failures = _addr_state.get(key, (None, 0))
     if succeeded:
-        _addr_state[label] = (idx, 0)
+        _addr_state[key] = (selected, 0)
         return
     failures += 1
     if failures < _ROTATE_AFTER_FAILURES or len(addrs) < 2:
-        _addr_state[label] = (idx, failures)
+        _addr_state[key] = (selected, failures)
         return
-    idx = (idx + 1) % len(addrs)
-    _addr_state[label] = (idx, 0)
+
+    order = _rotation_order(addrs)
+    try:
+        pos = order.index(selected)
+    except ValueError:
+        pos = -1
+    nxt = order[(pos + 1) % len(order)]
+    _addr_state[key] = (nxt, 0)
     collectd.warning(
-        f"{PLUGIN_NAME}: '{label}' failed {_ROTATE_AFTER_FAILURES} times, "
-        f"trying the next address {addrs[idx][1]}"
+        f"{PLUGIN_NAME}: {key[0]}:{key[1]} failed {_ROTATE_AFTER_FAILURES} times, "
+        f"trying the next address {nxt[1]}"
     )
 
 
@@ -264,6 +285,24 @@ def _parse_port(port_str, raw):
     return port
 
 
+def _numeric(node, cast, name, default):
+    """Read one numeric config value, or None if it cannot be read.
+
+    Out-of-range values already warned and fell back; a non-numeric one raised
+    straight out of config_cb, which aborts the whole block and leaves the
+    plugin half-configured. A typo in collectd.conf should be a warning like
+    every other bad value here, not an exception.
+    """
+    try:
+        return cast(node.values[0])
+    except (IndexError, TypeError, ValueError):
+        raw = node.values[0] if node.values else "(missing)"
+        collectd.warning(
+            f"{PLUGIN_NAME}: {name} {raw!r} is not a number, using default {default}"
+        )
+        return None
+
+
 def _emit(type_instance, value_type, value):
     v = collectd.Values()
     v.plugin = PLUGIN_NAME
@@ -297,22 +336,28 @@ def config_cb(conf):
                 _hosts.append(entry)
 
         elif key == "port":
-            port_val = int(node.values[0])
-            if not _valid_port(port_val):
+            port_val = _numeric(node, int, "Port", _default_port)
+            if port_val is None:
+                pass
+            elif not _valid_port(port_val):
                 collectd.warning(f"{PLUGIN_NAME}: Port {port_val} out of range [1, 65535], using default {_default_port}")
             else:
                 _default_port = port_val
 
         elif key == "timeout":
-            t = float(node.values[0])
-            if t <= 0 or t > 60.0:
+            t = _numeric(node, float, "Timeout", _timeout)
+            if t is None:
+                pass
+            elif t <= 0 or t > 60.0:
                 collectd.warning(f"{PLUGIN_NAME}: Timeout {t} out of range (0, 60], using default {_timeout}")
             else:
                 _timeout = t
 
         elif key == "pingcount":
-            pc = int(node.values[0])
-            if not 1 <= pc <= 100:
+            pc = _numeric(node, int, "PingCount", _ping_count)
+            if pc is None:
+                pass
+            elif not 1 <= pc <= 100:
                 collectd.warning(f"{PLUGIN_NAME}: PingCount {pc} out of range [1, 100], using default {_ping_count}")
             else:
                 _ping_count = pc
@@ -331,7 +376,39 @@ def config_cb(conf):
             collectd.warning(f"{PLUGIN_NAME}: unknown config key '{node.key}'")
 
 
+def _series_label(hostname, port, host_port):
+    """The type_instance a target dispatches under.
+
+    Hosts on the global Port keep the bare hostname so existing series are not
+    renamed; only an explicit per-host port is appended.
+    """
+    return hostname if host_port is None else f"{hostname}_{port}"
+
+
+def _warn_on_label_collisions():
+    """Two targets can render to the same series name.
+
+    Host "db_9999" on the global Port and Host "db:9999" both display as
+    "db_9999", and collectd would interleave them into one series. Renaming
+    either would break existing dashboards, so this says so loudly at startup
+    and leaves the choice to the operator.
+    """
+    seen = {}
+    for raw, hostname, host_port in _hosts:
+        port = host_port if host_port is not None else _default_port
+        label = _series_label(hostname, port, host_port)
+        if label in seen and seen[label] != raw:
+            collectd.warning(
+                f"{PLUGIN_NAME}: Host {raw!r} and Host {seen[label]!r} both report as "
+                f"'{label}'; their values will be interleaved into one series. "
+                f"Rename one, or give both an explicit port."
+            )
+        else:
+            seen[label] = raw
+
+
 def init_cb():
+    _warn_on_label_collisions()
     collectd.info(
         f"{PLUGIN_NAME}: probing {len(_hosts)} host(s), "
         f"port={_default_port}, timeout={_timeout}s, "
@@ -365,7 +442,7 @@ def read_cb():
         # "db:5432" and "db:9999" both dispatch as type_instance "db" and
         # overwrite each other. Hosts on the global Port keep the bare
         # hostname, so existing series are unaffected.
-        label = hostname if host_port is None else f"{hostname}_{port}"
+        label = _series_label(hostname, port, host_port)
 
         # Resolving costs wall-clock too, so honour the deadline before paying
         # for it: getaddrinfo() takes no timeout argument and a stuck resolver
@@ -379,7 +456,8 @@ def read_cb():
         addrs = _resolve_all(hostname, port)
         if addrs is None:
             collectd.warning(f"{PLUGIN_NAME}: cannot resolve '{hostname}', counting as drop")
-        addr_info = _preferred_address(label, addrs)
+        state_key = (hostname, port)
+        addr_info = _preferred_address(state_key, addrs)
 
         samples = []
         # Counted separately from ping_count: a probe that was never attempted
@@ -401,7 +479,7 @@ def read_cb():
             if rtt is not None:
                 samples.append(rtt)
 
-        _record_outcome(label, addrs, bool(samples))
+        _record_outcome(state_key, addrs, bool(samples))
 
         if addr_info is None:
             # Resolution failure is a real drop: the target cannot be reached.
